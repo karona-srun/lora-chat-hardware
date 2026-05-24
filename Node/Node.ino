@@ -520,6 +520,49 @@ static bool radioBase64DecodeUtf8(const String &s, String &out) {
     return rc == 0;
 }
 
+static bool isValidUtf8(const String &s) {
+    const uint8_t *bytes = (const uint8_t*)s.c_str();
+    size_t i = 0;
+    size_t len = s.length();
+
+    while (i < len) {
+        uint8_t c = bytes[i++];
+        if (c <= 0x7F) continue;
+
+        uint8_t continuationCount = 0;
+        uint32_t codePoint = 0;
+        if ((c & 0xE0) == 0xC0) {
+            continuationCount = 1;
+            codePoint = c & 0x1F;
+            if (codePoint == 0) return false; // overlong 2-byte sequence
+        } else if ((c & 0xF0) == 0xE0) {
+            continuationCount = 2;
+            codePoint = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            continuationCount = 3;
+            codePoint = c & 0x07;
+        } else {
+            return false;
+        }
+
+        if (i + continuationCount > len) return false;
+        for (uint8_t n = 0; n < continuationCount; n++) {
+            uint8_t next = bytes[i++];
+            if ((next & 0xC0) != 0x80) return false;
+            codePoint = (codePoint << 6) | (next & 0x3F);
+        }
+
+        if ((continuationCount == 1 && codePoint < 0x80) ||
+            (continuationCount == 2 && codePoint < 0x800) ||
+            (continuationCount == 3 && codePoint < 0x10000) ||
+            (codePoint >= 0xD800 && codePoint <= 0xDFFF) ||
+            codePoint > 0x10FFFF) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static String formatStructuredMessage(const String &fromContactId, const String &toContactId, const String &messageBody) {
     String out = fromContactId;
     out += "|";
@@ -870,13 +913,11 @@ bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, 
     String myAddrHex = toHex4((MY_ADDH << 8) | MY_ADDL);
     String toAddrHex = toHex4((((uint16_t)finalAddh) << 8) | finalAddl);
     String msgId = toHex4(++txMessageCounter);
-    String body64;
-    if (!radioBase64EncodeUtf8(msg, body64)) {
-        statusMsg = "ENC FAIL";
-        Serial.println("[TX] UTF-8 base64 encode failed");
-        return false;
-    }
-    String payload = "MSG3|" + msgId + "|" + myAddrHex + "|" + toAddrHex + "|" + body64;
+    if (viaRepeater) msgId += "R";  // Existing MSG3 readers still decode the UTF-8 body.
+    // Send chat bodies as UTF-8 bytes, not base64. The legacy MSG parser
+    // already treats everything after the source field as message text, so
+    // characters such as Khmer remain human-readable through a relay.
+    String payload = "MSG|" + msgId + "|" + myAddrHex + "|" + msg;
     String displayMsg = formatStructuredMessage(myAddrHex, toAddrHex, msg);
 
     bool acked = false;
@@ -928,6 +969,22 @@ static void buzzerAlertNewChatMessage() {
 // Receive Messages
 // =============================================================================
 
+static void sendChatAck(const String &msgId, const String &srcHex, bool viaRepeater) {
+    int32_t srcAddr = parseHex16(srcHex);
+    if (srcAddr < 0) return;
+
+    String ackPayload = "ACK|" + msgId;
+    if (viaRepeater) {
+        String relayAck = "RELAY|" + srcHex + "|" + ackPayload;
+        e22.sendFixedMessage(REPEATER_ADDH, REPEATER_ADDL, CHANNEL, relayAck);
+        return;
+    }
+
+    uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
+    uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
+    e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
+}
+
 void checkIncoming() {
     if (e22.available() <= 0) return;
 
@@ -967,19 +1024,12 @@ void checkIncoming() {
             String toContactId = payload.substring(p3 + 1, p4);
             String body64 = payload.substring(p4 + 1);
             String body;
-            if (!radioBase64DecodeUtf8(body64, body)) {
-                body = "[decode failed]";
+            if (!radioBase64DecodeUtf8(body64, body) || !isValidUtf8(body)) {
+                body = "[invalid UTF-8 message]";
             }
             logAddr = fromContactId;
 
-            int32_t srcAddr = parseHex16(fromContactId);
-            if (srcAddr >= 0) {
-                uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
-                uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
-                String ackPayload = "ACK|" + msgId;
-                e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
-            }
-
+            sendChatAck(msgId, fromContactId, msgId.endsWith("R"));
             payload = formatStructuredMessage(fromContactId, toContactId, body);
         }
     }
@@ -995,16 +1045,10 @@ void checkIncoming() {
             String fromContactId = payload.substring(p2 + 1, p3);
             String toContactId = payload.substring(p3 + 1, p4);
             String body = radioUnescapeField(payload.substring(p4 + 1));
+            if (!isValidUtf8(body)) body = "[invalid UTF-8 message]";
             logAddr = fromContactId;
 
-            int32_t srcAddr = parseHex16(fromContactId);
-            if (srcAddr >= 0) {
-                uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
-                uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
-                String ackPayload = "ACK|" + msgId;
-                e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
-            }
-
+            sendChatAck(msgId, fromContactId, false);
             payload = formatStructuredMessage(fromContactId, toContactId, body);
         }
     }
@@ -1018,16 +1062,10 @@ void checkIncoming() {
             String msgId = payload.substring(p1 + 1, p2);
             String srcHex = payload.substring(p2 + 1, p3);
             String body = payload.substring(p3 + 1);
+            if (!isValidUtf8(body)) body = "[invalid UTF-8 message]";
             logAddr = srcHex;
 
-            int32_t srcAddr = parseHex16(srcHex);
-            if (srcAddr >= 0) {
-                uint8_t srcAddh = (uint8_t)((srcAddr >> 8) & 0xFF);
-                uint8_t srcAddl = (uint8_t)(srcAddr & 0xFF);
-                String ackPayload = "ACK|" + msgId;
-                e22.sendFixedMessage(srcAddh, srcAddl, CHANNEL, ackPayload);
-            }
-
+            sendChatAck(msgId, srcHex, msgId.endsWith("R"));
             payload = formatStructuredMessage(srcHex, toHex4((MY_ADDH << 8) | MY_ADDL), body);
         }
     }
@@ -1170,18 +1208,20 @@ void handleRoot() {
     function sendMsg(useRelay) {
       let msg = document.getElementById('msgInput').value;
       if (!msg) { alert('Enter a message!'); return; }
-      const msgBytes = utf8ByteLength(msg.trim());
+      const msgBytes = utf8ByteLength(msg);
       if (msgBytes > MAX_CHAT_BODY_UTF8_BYTES) {
-        alert('Message too long: ' + msgBytes + ' bytes. Khmer limit is about 50 characters.');
+        alert('Message too long: ' + msgBytes + ' UTF-8 bytes. Limit is ' + MAX_CHAT_BODY_UTF8_BYTES + ' bytes.');
         return;
       }
       
       let to = document.getElementById('nodeSelect') ? document.getElementById('nodeSelect').value : '';
-      let base = useRelay ? '/send?relay=1' : '/send?';
-      let url = base + (base.endsWith('?') ? '' : '&') + 'msg=' + encodeURIComponent(msg);
-      if (to && to !== 'default') url += '&to=' + encodeURIComponent(to);
-
-      fetch(url)
+      let url = '/send' + (useRelay ? '?relay=1' : '');
+      if (to && to !== 'default') url += (url.indexOf('?') >= 0 ? '&' : '?') + 'to=' + encodeURIComponent(to);
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        body: msg
+      })
         .then(r => r.text().then(t => ({ ok: r.ok, text: t })))
         .then(result => {
           if (!result.ok) {
@@ -1450,7 +1490,7 @@ void handleRoot() {
 </body>
 </html>
 )rawliteral";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleSetupPage() {
@@ -1596,32 +1636,37 @@ static void parseOptionalSendDest(uint8_t &destAddh, uint8_t &destAddl, bool &ov
 }
 
 void handleSend() {
-    if (server.hasArg("msg")) {
-        String msg = server.arg("msg");
-        msg.trim();
-        if (msg.length() == 0) {
-            server.send(400, "text/plain", "Empty msg parameter");
-            return;
-        }
-        if (msg.length() > MAX_CHAT_BODY_UTF8_BYTES) {
-            server.send(413, "text/plain",
-                        "Message too long. Khmer uses 3 bytes per character; max is about 50 Khmer characters.");
-            return;
-        }
-        bool useRelay = server.hasArg("relay");
-        bool overrideDest = false;
-        uint8_t destAddh = 0;
-        uint8_t destAddl = 0;
-        parseOptionalSendDest(destAddh, destAddl, overrideDest);
+    String msg;
+    if (server.hasArg("plain")) {
+        msg = server.arg("plain");
+    } else if (server.hasArg("msg")) {
+        msg = server.arg("msg"); // Backward-compatible query/form requests.
+    }
 
-        bool acked = sendMessage(msg, useRelay, destAddh, destAddl, overrideDest);
-        if (acked) {
-            server.send(200, "text/plain", "OK (ACK)");
-        } else {
-            server.send(504, "text/plain", "Timeout waiting ACK");
-        }
+    if (msg.length() == 0) {
+        server.send(400, "text/plain; charset=utf-8", "Missing or empty message");
+        return;
+    }
+    if (msg.length() > MAX_CHAT_BODY_UTF8_BYTES) {
+        server.send(413, "text/plain; charset=utf-8",
+                    "Message too long. Limit is 150 UTF-8 bytes.");
+        return;
+    }
+    if (!isValidUtf8(msg)) {
+        server.send(400, "text/plain; charset=utf-8", "Invalid UTF-8 message bytes.");
+        return;
+    }
+    bool useRelay = server.hasArg("relay");
+    bool overrideDest = false;
+    uint8_t destAddh = 0;
+    uint8_t destAddl = 0;
+    parseOptionalSendDest(destAddh, destAddl, overrideDest);
+
+    bool acked = sendMessage(msg, useRelay, destAddh, destAddl, overrideDest);
+    if (acked) {
+        server.send(200, "text/plain; charset=utf-8", "OK (ACK)");
     } else {
-        server.send(400, "text/plain", "Missing msg parameter");
+        server.send(504, "text/plain; charset=utf-8", "Timeout waiting ACK");
     }
 }
 
@@ -1876,7 +1921,7 @@ void handleAPIStatus() {
     json += "}";
 
     json += "}";
-    server.send(200, "application/json", json);
+    server.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleAPILog() {
@@ -1895,7 +1940,7 @@ void handleAPILog() {
         json += "}";
     }
     json += "]";
-    server.send(200, "application/json", json);
+    server.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleAPINodes() {
@@ -1942,7 +1987,7 @@ void handleAPINodes() {
            ",\"myLat\":" + (myFix ? String(myLat, 6) : String("null")) +
            ",\"myLng\":" + (myFix ? String(myLng, 6) : String("null")) +
            ",\"nodes\":" + json + "}";
-    server.send(200, "application/json", json);
+    server.send(200, "application/json; charset=utf-8", json);
 }
 
 void sendHelloBeacon() {
@@ -2741,7 +2786,7 @@ void setup() {
     server.on("/setup/save", HTTP_POST, handleSetupSave);
     server.on("/setPower", HTTP_GET, handleSetPowerPage);
     server.on("/setPower/save", HTTP_POST, handleSetPowerSave);
-    server.on("/send", handleSend);
+    server.on("/send", HTTP_ANY, handleSend);
     server.on("/gps", handleGpsSend);
     server.on("/config", handleConfig);
     server.on("/status", handleStatusPage);
