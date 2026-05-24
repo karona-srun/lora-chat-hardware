@@ -12,10 +12,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <mbedtls/base64.h>
+#include <esp_system.h>
 #include "esp_sleep.h"
 
 // ----------------------------- WiFi credentials -------------------------------
-const char* ssid_AP    = "LMRalay-3";
+const char* ssid_AP    = "LMRalay-1";
 const char* password_AP = "12345678";
 
 // ----------------------------- Relay configuration ----------------------------
@@ -27,6 +28,8 @@ const char* password_AP = "12345678";
 
 #define SLEEP_IDLE_MS       30000   // enter sleep after 30s with no activity
 #define SLEEP_WAKE_POLL_US  500000  // light-sleep wake every 500ms to check LoRa/WiFi
+#define RELAY_LIGHT_SLEEP_ENABLED 0 // Keep USB serial/debug operation awake by default.
+#define USB_SAFE_E22_TX_POWER POWER_10
 
 // ────────────────────────────────────────────────
 // GPS on Serial1
@@ -78,7 +81,7 @@ char     gpsTimeUtc[16] = "--:--:--";
 //         deallocation over many hours of runtime.
 // =============================================================================
 #define MAX_LOG_ENTRIES 20
-#define MAX_MSG_LEN      220  // enough for Khmer UTF-8 chat bodies and decoded MSG3 logs
+#define MAX_MSG_LEN      220  // enough for Khmer UTF-8 chat bodies and decoded logs
 #define MAX_ADDR_LEN      5   // "FFFF\0"
 
 struct LogEntry {
@@ -112,16 +115,54 @@ static int countValidLogEntries() {
 static int jsonEscape(const char* src, char* dst, int dstLen) {
     int di = 0;
     for (int si = 0; src[si] && di < dstLen - 1; si++) {
-        char c = src[si];
+        unsigned char c = (unsigned char)src[si];
         if (c == '"'  && di < dstLen - 2) { dst[di++] = '\\'; dst[di++] = '"';  }
         else if (c == '\\' && di < dstLen - 2) { dst[di++] = '\\'; dst[di++] = '\\'; }
         else if (c == '\n' && di < dstLen - 2) { dst[di++] = '\\'; dst[di++] = 'n';  }
         else if (c == '\r' && di < dstLen - 2) { dst[di++] = '\\'; dst[di++] = 'r';  }
         else if (c == '\t' && di < dstLen - 2) { dst[di++] = '\\'; dst[di++] = 't';  }
-        else { dst[di++] = c; }
+        else if (c < 0x20 && di < dstLen - 7) {
+            int n = snprintf(dst + di, dstLen - di, "\\u%04X", c);
+            if (n <= 0) break;
+            di += n;
+        }
+        else { dst[di++] = (char)c; }
     }
     dst[di] = '\0';
     return di;
+}
+
+static size_t utf8CharLen(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static void copyUtf8Safe(char* dst, size_t dstLen, const char* src) {
+    if (!dst || dstLen == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t si = 0;
+    size_t di = 0;
+    while (src[si] && di < dstLen - 1) {
+        size_t count = utf8CharLen((unsigned char)src[si]);
+        if (di + count >= dstLen) break;
+        bool complete = true;
+        for (size_t j = 1; j < count; j++) {
+            if (!src[si + j] || (((unsigned char)src[si + j] & 0xC0) != 0x80)) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) break;
+        for (size_t j = 0; j < count; j++) dst[di++] = src[si++];
+    }
+    dst[di] = '\0';
 }
 
 static bool base64DecodeUtf8(const char* src, char* dst, size_t dstLen) {
@@ -160,6 +201,29 @@ static bool decodeMsg3ForLog(const char* frame, char* srcAddr, size_t srcLen,
     return base64DecodeUtf8(p4 + 1, msgOut, msgLen);
 }
 
+static bool decodeRawMsgForLog(const char* frame, char* srcAddr, size_t srcLen,
+                               const char* relayDest, char* destAddr, size_t destLen,
+                               char* msgOut, size_t msgLen) {
+    if (!frame || strncmp(frame, "MSG|", 4) != 0 || !relayDest) return false;
+
+    const char* p1 = strchr(frame, '|');       // after MSG
+    if (!p1) return false;
+    const char* p2 = strchr(p1 + 1, '|');      // after id
+    if (!p2) return false;
+    const char* p3 = strchr(p2 + 1, '|');      // after source
+    if (!p3) return false;
+
+    size_t srcFieldLen = (size_t)(p3 - (p2 + 1));
+    if (srcFieldLen != 4 || srcLen < 5 || destLen < 5 || strlen(relayDest) != 4) return false;
+
+    memcpy(srcAddr, p2 + 1, 4);
+    srcAddr[4] = '\0';
+    memcpy(destAddr, relayDest, 4);
+    destAddr[4] = '\0';
+    copyUtf8Safe(msgOut, msgLen, p3 + 1);
+    return true;
+}
+
 void addLogEntry(const char* direction, int8_t rssi,
                  const char* src, const char* dest, const char* msg) {
     LogEntry& e = messageLog[logHead];
@@ -172,8 +236,7 @@ void addLogEntry(const char* direction, int8_t rssi,
     e.srcAddr[sizeof(e.srcAddr) - 1] = '\0';
     strncpy(e.destAddr,  dest,      sizeof(e.destAddr)  - 1);
     e.destAddr[sizeof(e.destAddr) - 1] = '\0';
-    strncpy(e.message,   msg,       sizeof(e.message)   - 1);
-    e.message[sizeof(e.message) - 1] = '\0';
+    copyUtf8Safe(e.message, sizeof(e.message), msg);
 
     logHead = (logHead + 1) % MAX_LOG_ENTRIES;
 }
@@ -365,6 +428,33 @@ bool applyRelayConfig() {
     Configuration config = *(Configuration*)c.data;
     c.close();
 
+    // The ESP32 handles forwarding in handleSoftwareRelay(); leaving the
+    // module repeater enabled can cause a second, uncontrolled RF transmit.
+    bool changed =
+        config.ADDH != REPEATER_ADDH ||
+        config.ADDL != REPEATER_ADDL ||
+        config.NETID != COMMON_NETID ||
+        config.CHAN != COMMON_CHAN ||
+        config.CRYPT.CRYPT_H != highByte(CRYPT_KEY) ||
+        config.CRYPT.CRYPT_L != lowByte(CRYPT_KEY) ||
+        (uint8_t)config.SPED.uartBaudRate != UART_BPS_9600 ||
+        (uint8_t)config.SPED.airDataRate != AIR_DATA_RATE_010_24 ||
+        (uint8_t)config.SPED.uartParity != MODE_00_8N1 ||
+        (uint8_t)config.OPTION.subPacketSetting != SPS_240_00 ||
+        (uint8_t)config.OPTION.RSSIAmbientNoise != RSSI_AMBIENT_NOISE_DISABLED ||
+        (uint8_t)config.OPTION.transmissionPower != USB_SAFE_E22_TX_POWER ||
+        (uint8_t)config.TRANSMISSION_MODE.enableRSSI != RSSI_ENABLED ||
+        (uint8_t)config.TRANSMISSION_MODE.fixedTransmission != FT_FIXED_TRANSMISSION ||
+        (uint8_t)config.TRANSMISSION_MODE.enableRepeater != REPEATER_DISABLED ||
+        (uint8_t)config.TRANSMISSION_MODE.enableLBT != LBT_DISABLED ||
+        (uint8_t)config.TRANSMISSION_MODE.WORTransceiverControl != WOR_RECEIVER ||
+        (uint8_t)config.TRANSMISSION_MODE.WORPeriod != WOR_2000_011;
+
+    if (!changed) {
+        Serial.println("[CONFIG] E22 already configured; skipped flash write");
+        return true;
+    }
+
     config.ADDH  = REPEATER_ADDH;
     config.ADDL  = REPEATER_ADDL;
     config.NETID = COMMON_NETID;
@@ -379,11 +469,11 @@ bool applyRelayConfig() {
 
     config.OPTION.subPacketSetting  = SPS_240_00;
     config.OPTION.RSSIAmbientNoise  = RSSI_AMBIENT_NOISE_DISABLED;
-    config.OPTION.transmissionPower = POWER_22;
+    config.OPTION.transmissionPower = USB_SAFE_E22_TX_POWER;
 
     config.TRANSMISSION_MODE.enableRSSI            = RSSI_ENABLED;
     config.TRANSMISSION_MODE.fixedTransmission     = FT_FIXED_TRANSMISSION;
-    config.TRANSMISSION_MODE.enableRepeater        = REPEATER_ENABLED;
+    config.TRANSMISSION_MODE.enableRepeater        = REPEATER_DISABLED;
     config.TRANSMISSION_MODE.enableLBT             = LBT_DISABLED;
     config.TRANSMISSION_MODE.WORTransceiverControl = WOR_RECEIVER;
     config.TRANSMISSION_MODE.WORPeriod             = WOR_2000_011;
@@ -394,6 +484,7 @@ bool applyRelayConfig() {
     delay(300);
     if (!waitAuxHigh(5000)) return false;
     delay(100);
+    Serial.println("[CONFIG] E22 software-relay mode, TX power ~10 dBm");
     return true;
 }
 
@@ -420,18 +511,19 @@ void handleSoftwareRelay() {
 
     Serial.printf("[RX] RSSI=%d data=%s\n", rssi, rxBuf);
 
-    char logSrc[MAX_ADDR_LEN] = "????";
-    char logDest[MAX_ADDR_LEN] = "FFFF";
-    char decodedMsg[MAX_MSG_LEN];
-    const char* logMsg = rxBuf;
-    if (decodeMsg3ForLog(rxBuf, logSrc, sizeof(logSrc), logDest, sizeof(logDest),
-                         decodedMsg, sizeof(decodedMsg))) {
-        logMsg = decodedMsg;
-    }
-    addLogEntry("RX", rssi, logSrc, logDest, logMsg);
-
     // Expected format: "RELAY|XXYY|<payload>"
-    if (strncmp(rxBuf, "RELAY|", 6) != 0) return;
+    if (strncmp(rxBuf, "RELAY|", 6) != 0) {
+        char logSrc[MAX_ADDR_LEN] = "????";
+        char logDest[MAX_ADDR_LEN] = "FFFF";
+        char decodedMsg[MAX_MSG_LEN];
+        const char* logMsg = rxBuf;
+        if (decodeMsg3ForLog(rxBuf, logSrc, sizeof(logSrc), logDest, sizeof(logDest),
+                             decodedMsg, sizeof(decodedMsg))) {
+            logMsg = decodedMsg;
+        }
+        addLogEntry("RX", rssi, logSrc, logDest, logMsg);
+        return;
+    }
 
     char* p1 = strchr(rxBuf + 6, '|');
     if (!p1) return;
@@ -458,13 +550,17 @@ void handleSoftwareRelay() {
     if (decodeMsg3ForLog(payload, relaySrc, sizeof(relaySrc), destHex, sizeof(destHex),
                          relayDecodedMsg, sizeof(relayDecodedMsg))) {
         relayLogMsg = relayDecodedMsg;
+    } else if (decodeRawMsgForLog(payload, relaySrc, sizeof(relaySrc), destHex,
+                                  destHex, sizeof(destHex), relayDecodedMsg,
+                                  sizeof(relayDecodedMsg))) {
+        relayLogMsg = relayDecodedMsg;
     }
 
     ResponseStatus rs = e22.sendFixedMessage(destAddh, destAddl, COMMON_CHAN, payload);
     if (rs.code == 1) {
         relayCount++;
         noteActivity();
-        addLogEntry("RELAY", 0, relaySrc, destHex, relayLogMsg);
+        addLogEntry("RELAY", rssi, relaySrc, destHex, relayLogMsg);
         Serial.printf("[RELAY] -> 0x%02X%02X: %s\n", destAddh, destAddl, payload);
     } else {
         Serial.printf("[RELAY] FAIL code=%d -> 0x%02X%02X\n", rs.code, destAddh, destAddl);
@@ -614,7 +710,7 @@ void handleRoot() {
     String page = FPSTR(PAGE_HTML);   // one-shot copy into a String (unavoidable for WebServer::send)
     page.replace("__SSID__", ssid_AP);
     page.replace("__IP__",   WiFi.softAPIP().toString());
-    server.send(200, "text/html", page);
+    server.send(200, "text/html; charset=utf-8", page);
     page = String();   // immediately release
 }
 
@@ -657,7 +753,7 @@ void handleAPIStatus() {
         (unsigned)ESP.getFreeHeap(),
         inSleepMode ? "true" : "false"
     );
-    server.send(200, "application/json", buf);
+    server.send(200, "application/json; charset=utf-8", buf);
 }
 
 void handleAPILog() {
@@ -671,7 +767,7 @@ void handleAPILog() {
     // Use a heap allocation here (once per request) to avoid a large stack frame.
     const int JSON_SIZE = 8192;
     char* buf = (char*)malloc(JSON_SIZE);
-    if (!buf) { server.send(500, "application/json", "[]"); return; }
+    if (!buf) { server.send(500, "application/json; charset=utf-8", "[]"); return; }
 
     int pos = 0;
     buf[pos++] = '[';
@@ -682,10 +778,10 @@ void handleAPILog() {
         int idx = (logHead + i) % MAX_LOG_ENTRIES;
         if (!messageLog[idx].valid) continue;
 
-        char escapedMsg[MAX_MSG_LEN * 2 + 1];   // worst case: every char escaped
+        char escapedMsg[MAX_MSG_LEN * 6 + 1];   // worst case: every byte JSON-escaped
         jsonEscape(messageLog[idx].message, escapedMsg, sizeof(escapedMsg));
 
-        char entry[640];
+        char entry[1600];
         int n = snprintf(entry, sizeof(entry),
             "%s{\"time\":\"%us\",\"dir\":\"%s\",\"rssi\":\"%d\","
             "\"src\":\"%s\",\"dest\":\"%s\",\"msg\":\"%s\"}",
@@ -708,7 +804,7 @@ void handleAPILog() {
     buf[pos++] = ']';
     buf[pos]   = '\0';
 
-    server.send(200, "application/json", buf);
+    server.send(200, "application/json; charset=utf-8", buf);
     free(buf);
 }
 
@@ -716,10 +812,28 @@ void handleAPILog() {
 // Setup
 // =============================================================================
 
+static const char* resetReasonText(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXTERNAL_RESET";
+        case ESP_RST_SW:        return "SOFTWARE_RESET";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INTERRUPT_WATCHDOG";
+        case ESP_RST_TASK_WDT:  return "TASK_WATCHDOG";
+        case ESP_RST_WDT:       return "OTHER_WATCHDOG";
+        case ESP_RST_DEEPSLEEP: return "DEEP_SLEEP_WAKE";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
+
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(100);
     Serial.println("\n=== LoRa Hardware Relay with WebUI ===");
+    Serial.printf("[BOOT] Reset reason: %s (%d)\n",
+                  resetReasonText(esp_reset_reason()), (int)esp_reset_reason());
 
     startTime = millis();
     lastActivityMs = millis();
@@ -731,6 +845,7 @@ void setup() {
 
     WiFi.mode(WIFI_AP);
     WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     WiFi.softAP(ssid_AP, password_AP);
     Serial.printf("AP: %s  IP: %s\n", ssid_AP, WiFi.softAPIP().toString().c_str());
 
@@ -798,7 +913,7 @@ void loop() {
 
     }
 
-    if ((uint32_t)(millis() - lastActivityMs) >= SLEEP_IDLE_MS) {
+    if (RELAY_LIGHT_SLEEP_ENABLED && (uint32_t)(millis() - lastActivityMs) >= SLEEP_IDLE_MS) {
         enterSleepMode();
         return;
     }
