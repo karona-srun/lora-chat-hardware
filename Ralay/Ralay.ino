@@ -29,7 +29,7 @@ const char* password_AP = "12345678";
 #define SLEEP_IDLE_MS       30000   // enter sleep after 30s with no activity
 #define SLEEP_WAKE_POLL_US  500000  // light-sleep wake every 500ms to check LoRa/WiFi
 #define RELAY_LIGHT_SLEEP_ENABLED 0 // Keep USB serial/debug operation awake by default.
-#define USB_SAFE_E22_TX_POWER POWER_10
+#define USB_SAFE_E22_TX_POWER POWER_22
 
 // ────────────────────────────────────────────────
 // GPS on Serial1
@@ -484,7 +484,7 @@ bool applyRelayConfig() {
     delay(300);
     if (!waitAuxHigh(5000)) return false;
     delay(100);
-    Serial.println("[CONFIG] E22 software-relay mode, TX power ~10 dBm");
+    Serial.println("[CONFIG] E22 software-relay mode, TX power ~33 dBm");
     return true;
 }
 
