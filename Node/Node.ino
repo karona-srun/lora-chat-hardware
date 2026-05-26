@@ -14,12 +14,13 @@
 #include <TinyGPSPlus.h>
 #include <mbedtls/base64.h>
 #include <math.h>
+#include <esp_system.h>
 
 // ----------------------------- Dynamic Configuration -------------------------
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x04;     // Default Node ID
+uint8_t MY_ADDL = 0x03;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -44,6 +45,7 @@ String defaultApSsid() {
 
 #define BAT_READER    35  // ADC pin for battery voltage  // 35 New ADC pin for battery voltage
 #define BAT_CHARGING  34  // HIGH when charging (input only)
+#define BAT_CHARGING_ACTIVE_LEVEL HIGH // Match this board's charge-detect circuit.
 
 // Battery ADC. GPIO35 uses the battery divider in normal/unplugged mode.
 // Charging can lift the ADC-side voltage above the real 1-cell battery voltage,
@@ -58,11 +60,20 @@ String defaultApSsid() {
 // Five-way control: Left/Right change screen; Up/Down adjust values in settings edit;
 // Select opens Display settings from other screens; on Display screen, Select toggles edit.
 // All pressed = LOW.
-#define BTN_LEFT_PIN    23
-#define BTN_RIGHT_PIN   32
-#define BTN_UP_PIN      5
-#define BTN_DOWN_PIN    14
-#define BTN_SELECT_PIN  13
+
+// Old
+// #define BTN_LEFT_PIN    23
+// #define BTN_RIGHT_PIN   32
+// #define BTN_UP_PIN      5 
+// #define BTN_DOWN_PIN    14
+// #define BTN_SELECT_PIN  13
+
+// New Pin
+#define BTN_LEFT_PIN    32
+#define BTN_RIGHT_PIN   23
+#define BTN_UP_PIN      5 
+#define BTN_DOWN_PIN    13
+#define BTN_SELECT_PIN  14
 
 // ────────────────────────────────────────────────
 // GPS on Serial1
@@ -90,6 +101,7 @@ float batteryVoltage   = 3.79f;
 int batteryPercent     = 100;
 bool batteryCharging   = false;
 bool lastBatteryCharging = false;
+bool brownoutRecoveryMode = false;
 
 int currentScreen = 0;
 unsigned long lastRightBtnPress = 0;
@@ -119,6 +131,8 @@ const unsigned long CHARGE_PIN_RELEASE_MS = 2500UL; // pin LOW this long → lea
 const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
 // Charging animation tick (partial OLED updates — no full clear every frame)
 const unsigned long UI_REFRESH_CHARGING_MS = 500UL;
+const uint8_t STABLE_E22_TX_POWER = 3; // POWER_10: lowest-current E22 transmit mode.
+const bool PERIODIC_HELLO_ENABLED = false; // Avoid unattended RF current bursts.
 
 #define NUM_SCREENS 4
 
@@ -353,6 +367,117 @@ static void showBootMessage(const char *line1, const char *line2) {
     display.println(line1);
     display.println(line2);
     display.display();
+}
+
+// Full splash adaptation for a 128x64 monochrome OLED.
+static const uint8_t LOMHOR_SPLASH_BITMAP[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x80, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x7f, 0x3c, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0xff, 0xc8, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x03, 0x80, 0xe0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xb8, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xb8, 0x00, 0x00, 0x00, 0xe3, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf1, 0xc3, 0x81, 0xfc, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0xc7, 0xc7, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcf, 0xef, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x03, 0xce, 0x6f, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xc3, 0xce, 0xef, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe3, 0xc7, 0xcf, 0xbe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xfb, 0xc7, 0xcf, 0x3e, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xff, 0xc7, 0xdf, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xc7, 0xff, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xce, 0xff, 0xc7, 0xff, 0x3e, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x7f, 0xc7, 0xff, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x3f, 0xc7, 0xfe, 0x3e, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x07, 0xf8, 0x1c, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const int LOMHOR_SPLASH_WIDTH = 128;
+static const int LOMHOR_SPLASH_HEIGHT = 64;
+
+static void showSplashScreen() {
+    if (!oledReady) return;
+
+    const unsigned long splashDurationMs = 2000UL;
+    const char *version = "v0.0.12";
+    const int barX = 0;
+    const int barY = SCREEN_HEIGHT - 4;
+    const int barWidth = SCREEN_WIDTH;
+    const int barHeight = 4;
+    const int barRadius = 3;
+    int16_t textX, textY;
+    uint16_t textWidth, textHeight;
+
+    display.clearDisplay();
+    display.drawBitmap((SCREEN_WIDTH - LOMHOR_SPLASH_WIDTH),
+                       (SCREEN_HEIGHT - LOMHOR_SPLASH_HEIGHT),
+                       LOMHOR_SPLASH_BITMAP, LOMHOR_SPLASH_WIDTH,
+                       LOMHOR_SPLASH_HEIGHT, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.getTextBounds(version, 0, 0, &textX, &textY, &textWidth, &textHeight);
+    display.setCursor(SCREEN_WIDTH - (int)textWidth, 0);
+    display.print(version);
+    display.drawRoundRect(barX, barY, barWidth, barHeight, barRadius, SSD1306_WHITE);
+
+    unsigned long startedAt = millis();
+    unsigned long elapsed = 0;
+    while (elapsed < splashDurationMs) {
+        elapsed = millis() - startedAt;
+        int fillWidth = (int)((unsigned long)(barWidth - 2) *
+                              min(elapsed, splashDurationMs) / splashDurationMs);
+        if (fillWidth > 0) {
+            display.fillRoundRect(barX + 1, barY + 1, fillWidth, barHeight - 2,
+                                  barRadius, SSD1306_WHITE);
+        }
+        display.display();
+        delay(40);
+    }
 }
 
 static bool initOled() {
@@ -826,6 +951,10 @@ bool waitAuxHigh(uint32_t timeoutMs = 5000) {
 // Apply Configuration to E22
 // =============================================================================
 
+static bool radioTransmissionAllowed() {
+    return !batteryCharging && !brownoutRecoveryMode;
+}
+
 bool applyNodeConfig() {
     if (!waitAuxHigh(8000)) return false;
     delay(100);
@@ -856,11 +985,15 @@ bool applyNodeConfig() {
 
     config.OPTION.subPacketSetting  = SPS_240_00;
     config.OPTION.RSSIAmbientNoise  = RSSI_AMBIENT_NOISE_DISABLED;
-    config.OPTION.transmissionPower = E22_TX_POWER & 0x03;
+    // This hardware resets on weak USB/serial power during RF bursts. Keep the
+    // radio at its lowest-current output in this stable firmware version.
+    config.OPTION.transmissionPower = STABLE_E22_TX_POWER;
 
     config.TRANSMISSION_MODE.enableRSSI            = RSSI_ENABLED;
     config.TRANSMISSION_MODE.fixedTransmission     = FT_FIXED_TRANSMISSION;
-    config.TRANSMISSION_MODE.enableRepeater        = USE_REPEATER ? REPEATER_ENABLED : REPEATER_DISABLED;
+    // Application relay routing uses RELAY packets; a Node must not
+    // automatically repeat received packets in hardware.
+    config.TRANSMISSION_MODE.enableRepeater        = REPEATER_DISABLED;
     config.TRANSMISSION_MODE.enableLBT             = LBT_DISABLED;
     config.TRANSMISSION_MODE.WORTransceiverControl = WOR_RECEIVER;
     config.TRANSMISSION_MODE.WORPeriod             = WOR_2000_011;
@@ -875,6 +1008,7 @@ bool applyNodeConfig() {
     Serial.println("[CONFIG] Applied to E22 module");
     Serial.printf("[KEY] CRYPT=0x%04X (H:%s L:%s)\n", CRYPT,
                   toHex2(highByte(CRYPT)).c_str(), toHex2(lowByte(CRYPT)).c_str());
+    Serial.println("[POWER] Stable mode active: E22 TX power ~10 dBm, hardware repeater disabled");
     return true;
 }
 
@@ -901,6 +1035,11 @@ static bool waitForAck(const String& msgId, unsigned long timeoutMs) {
 }
 
 bool sendMessage(String msg, bool viaRepeater = false, uint8_t destAddh = 0xFF, uint8_t destAddl = 0xFF, bool overrideDest = false) {
+    if (!radioTransmissionAllowed()) {
+        statusMsg = batteryCharging ? "CHARGING RX ONLY" : "BROWNOUT RX ONLY";
+        Serial.println("[TX] Blocked while charging/brownout protection is active");
+        return false;
+    }
     if (msg.length() > MAX_CHAT_BODY_UTF8_BYTES) {
         statusMsg = "MSG TOO LONG";
         Serial.printf("[TX] Message too long: %u bytes (max %u)\n",
@@ -970,6 +1109,10 @@ static void buzzerAlertNewChatMessage() {
 // =============================================================================
 
 static void sendChatAck(const String &msgId, const String &srcHex, bool viaRepeater) {
+    if (!radioTransmissionAllowed()) {
+        Serial.printf("[ACK] Not transmitted while protected (id=%s)\n", msgId.c_str());
+        return;
+    }
     int32_t srcAddr = parseHex16(srcHex);
     if (srcAddr < 0) return;
 
@@ -1656,6 +1799,11 @@ void handleSend() {
         server.send(400, "text/plain; charset=utf-8", "Invalid UTF-8 message bytes.");
         return;
     }
+    if (!radioTransmissionAllowed()) {
+        server.send(503, "text/plain; charset=utf-8",
+                    "Radio transmit disabled while charging or recovering from brownout.");
+        return;
+    }
     bool useRelay = server.hasArg("relay");
     bool overrideDest = false;
     uint8_t destAddh = 0;
@@ -1674,6 +1822,11 @@ void handleSend() {
 //   GPS,Stas,<sats>,<lat>,<lng>   ("Stas" = stats / satellite count field)
 // Optional: same as /send — relay=1, to=AABB, addh=&addl=
 void handleGpsSend() {
+    if (!radioTransmissionAllowed()) {
+        server.send(503, "text/plain; charset=utf-8",
+                    "Radio transmit disabled while charging or recovering from brownout.");
+        return;
+    }
     while (gpsSerial.available() > 0) {
         gps.encode(gpsSerial.read());
     }
@@ -1754,6 +1907,9 @@ void handleStatusPage() {
     appendStatusRow(html, "Use repeater (app)", USE_REPEATER ? "yes" : "no");
     appendStatusRow(html, "Battery", getBattery());
     appendStatusRow(html, "Charging", String(batteryCharging));
+    appendStatusRow(html, "Power protection", brownoutRecoveryMode ? "brownout receive-only" :
+                    (batteryCharging ? "charging receive-only" : "stable low TX power"));
+    appendStatusRow(html, "Automatic beacon TX", PERIODIC_HELLO_ENABLED ? "enabled" : "disabled");
     html += F("</table>");
 
     html += F("<h2>E22 module (read from radio)</h2><table>");
@@ -1868,6 +2024,8 @@ void handleAPIStatus() {
     json += "\"battery\":" + String(batteryPercent) + ",";
     json += "\"batteryVoltage\":" + String(batteryVoltage, 2) + ",";
     json += "\"charging\":\"" + jsonEscape(getCharging()) + "\",";
+    json += "\"brownoutRecovery\":" + String(brownoutRecoveryMode ? "true" : "false") + ",";
+    json += "\"txAllowed\":" + String(radioTransmissionAllowed() ? "true" : "false") + ",";
     json += "\"ip\":\"" + jsonEscape(WiFi.softAPIP().toString()) + "\",";
     json += "\"myAddr\":\"" + toHex2(MY_ADDH) + toHex2(MY_ADDL) + "\",";
     json += "\"targetAddr\":\"" + toHex2(TARGET_ADDH) + toHex2(TARGET_ADDL) + "\",";
@@ -1877,6 +2035,7 @@ void handleAPIStatus() {
     json += "\"crypt\":\"" + toHex4(CRYPT) + "\",";
     json += "\"useRepeater\":" + String(USE_REPEATER ? "true" : "false") + ",";
     json += "\"txPower\":" + String(E22_TX_POWER) + ",";
+    json += "\"runtimeTxPower\":" + String(STABLE_E22_TX_POWER) + ",";
     json += "\"alertsBeep\":" + String(alertsBeepEnabled ? "true" : "false");
     json += "},";
 
@@ -1991,6 +2150,9 @@ void handleAPINodes() {
 }
 
 void sendHelloBeacon() {
+    if (!PERIODIC_HELLO_ENABLED || !radioTransmissionAllowed()) {
+        return;
+    }
     // Beacon format (backward compatible):
     // HELLO|AABB|NN|CC|R/N|callSign
     // HELLO|AABB|NN|CC|R/N|callSign|lat|lng   (if GPS fix)
@@ -2104,37 +2266,41 @@ void readBattery() {
   batteryVoltage = filterBatteryVoltage(vInstant);
   batteryPercent = batteryPercentFromVoltage(batteryVoltage);
 
-  static bool chargePinHigh = false;
-  static unsigned long chargeHighSince = 0;
-  static unsigned long chargeLowSince = 0;
+  static bool chargeSignalActive = false;
+  static unsigned long chargeActiveSince = 0;
+  static unsigned long chargeInactiveSince = 0;
   static bool chargeDebounceInit = false;
-
-  if (!chargeDebounceInit) {
-    chargeDebounceInit = true;
-    chargeHighSince = millis();
-    chargeLowSince = millis();
-    chargePinHigh = (digitalRead(BAT_CHARGING) == HIGH);
-  }
-
-  bool rawNow = (digitalRead(BAT_CHARGING) == HIGH);
+  bool rawNow = (digitalRead(BAT_CHARGING) == BAT_CHARGING_ACTIVE_LEVEL);
   unsigned long now = millis();
   bool wasCharging = batteryCharging;
 
-  if (rawNow) {
-    if (!chargePinHigh) {
-      chargePinHigh = true;
-      chargeHighSince = now;
+  if (!chargeDebounceInit) {
+    chargeDebounceInit = true;
+    chargeActiveSince = now;
+    chargeInactiveSince = now;
+    chargeSignalActive = rawNow;
+
+    // Show charging immediately when USB/charging power is already present at boot.
+    if (rawNow) {
+      batteryCharging = true;
     }
-    if (!batteryCharging && (now - chargeHighSince) >= CHARGE_PIN_DEBOUNCE_MS) {
+  }
+
+  if (rawNow) {
+    if (!chargeSignalActive) {
+      chargeSignalActive = true;
+      chargeActiveSince = now;
+    }
+    if (!batteryCharging && (now - chargeActiveSince) >= CHARGE_PIN_DEBOUNCE_MS) {
       lastBatteryCharging = batteryCharging;
       batteryCharging = true;
     }
   } else {
-    if (chargePinHigh) {
-      chargePinHigh = false;
-      chargeLowSince = now;
+    if (chargeSignalActive) {
+      chargeSignalActive = false;
+      chargeInactiveSince = now;
     }
-    if (batteryCharging && (now - chargeLowSince) >= CHARGE_PIN_RELEASE_MS) {
+    if (batteryCharging && (now - chargeInactiveSince) >= CHARGE_PIN_RELEASE_MS) {
       lastBatteryCharging = batteryCharging;
       batteryCharging = false;
       chargeScreenUiReady = false;
@@ -2146,6 +2312,7 @@ void readBattery() {
   }
 
   if (batteryCharging) {
+    if (nodeReady) statusMsg = "CHARGING RX ONLY";
     chargeScreenSuppressed = false;
     chargeScreenUiReady = false;
     if (oledDisplayOff) {
@@ -2156,6 +2323,7 @@ void readBattery() {
     noteDisplayActivity();
     drawCurrentScreen();
   } else if (wasCharging) {
+    if (nodeReady && !brownoutRecoveryMode) statusMsg = USE_REPEATER ? "REPEATER" : "READY";
     noteDisplayActivity();
     drawCurrentScreen();
   }
@@ -2759,6 +2927,10 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== LoRa Node with Dynamic Config ===");
+    esp_reset_reason_t resetReason = esp_reset_reason();
+    brownoutRecoveryMode = (resetReason == ESP_RST_BROWNOUT);
+    Serial.printf("[BOOT] Reset reason: %d%s\n", (int)resetReason,
+                  brownoutRecoveryMode ? " (brownout protection enabled)" : "");
 
     startTime = millis();
     // Clear cache
@@ -2768,12 +2940,22 @@ void setup() {
     // Load saved configuration
     loadConfig();
 
+    // Charging must be known before WiFi/radio setup so boot can remain
+    // receive-only and select the charging screen on an attached charger.
+    pinMode(BAT_READER, INPUT);
+    pinMode(BAT_CHARGING, INPUT);
+    analogReadResolution(12);
+    analogSetPinAttenuation(BAT_READER, ADC_11db);
+    readBattery();
+
     pinMode(PIN_AUX, INPUT);
     pinMode(PIN_M0,  OUTPUT);
     pinMode(PIN_M1,  OUTPUT);
 
     // Initialize WiFi AP
     WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
     WiFi.softAP(ssid_AP, password_AP,1,0,1);
     Serial.print("AP: ");
     Serial.println(ssid_AP);
@@ -2803,8 +2985,9 @@ void setup() {
     // Initialize OLED first and show boot status before LoRa init.
     // This fixes the blank-screen case where E22/config fails before the first draw.
     initOled();
+    showSplashScreen();
     noteDisplayActivity();
-    showBootMessage("LoRa Node", "OLED starting...");
+    // showBootMessage("LoRa Node", "OLED starting...");
 
     // Initialize E22
     bool e22Started = e22.begin();
@@ -2818,7 +3001,8 @@ void setup() {
     // Apply configuration
     if (e22Started && applyNodeConfig()) {
         nodeReady = true;
-        statusMsg = USE_REPEATER ? "REPEATER" : "READY";
+        statusMsg = radioTransmissionAllowed() ? (USE_REPEATER ? "REPEATER" : "READY") :
+                    (batteryCharging ? "CHARGING RX ONLY" : "BROWNOUT RX ONLY");
         Serial.printf("[READY] Node 0x%02X%02X active (Net: 0x%02X)\n", 
             MY_ADDH, MY_ADDL, NETWORK_ID);
     } else if (e22Started) {
@@ -2837,10 +3021,6 @@ void setup() {
     pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
     pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
 
-    pinMode(BAT_READER, INPUT);
-    pinMode(BAT_CHARGING, INPUT);
-    analogReadResolution(12);
-    analogSetPinAttenuation(BAT_READER, ADC_11db);
     readBattery();
     // lastSyncBroadcastMs = millis();
     drawCurrentScreen();
@@ -2868,7 +3048,8 @@ void loop() {
   }
 
   // Periodic discovery beacon to help UIs list nearby nodes
-  if (nodeReady && (millis() - lastBeaconAt >= 5000)) {
+  if (nodeReady && PERIODIC_HELLO_ENABLED && radioTransmissionAllowed() &&
+      (millis() - lastBeaconAt >= 5000)) {
       lastBeaconAt = millis();
       sendHelloBeacon();
   }
