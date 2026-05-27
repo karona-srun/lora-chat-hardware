@@ -124,8 +124,9 @@ unsigned long popupUntilMs = 0;
 const bool AUTO_GPS_ENABLED = true;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
 const unsigned long BTN_RIGHT_LONG_PRESS_MS = 3000UL;
-// Display screen: hold SELECT this long to write sleep/brightness to flash
+// Display screen: hold SELECT this long to explicitly write settings to flash
 const unsigned long BTN_SETTINGS_HOLD_SAVE_MS = 700UL;
+const unsigned long SETTINGS_SAVED_NOTICE_MS = 1500UL;
 const unsigned long CHARGE_PIN_DEBOUNCE_MS = 400UL;   // pin HIGH this long → enter charging UI
 const unsigned long CHARGE_PIN_RELEASE_MS = 2500UL; // pin LOW this long → leave charging UI (stops flicker)
 const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
@@ -145,6 +146,7 @@ uint8_t settingsEditField = 0;   // focused row: 0=sleep, 1=brightness, 2=alert 
 bool settingsAdjusting = false;  // true: L/R change values (preview, not flash)
 bool settingsDirty = false;      // true: preview differs from last save
 bool alertsBeepEnabled = true;   // buzzer on new MSG2/MSG (saved with OLED settings)
+unsigned long settingsSavedUntilMs = 0;
 bool oledIgnoreButtonsUntilRelease = false;
 
 // ----------------------------- E22 pins --------------------------------------
@@ -308,12 +310,26 @@ void saveConfig() {
     Serial.println("Configuration saved!");
 }
 
-void saveOledSettings() {
+bool saveOledSettings() {
     preferences.begin("lora-config", false);
-    preferences.putUChar("oled_sleep", oledSleepMode);
-    preferences.putUChar("oled_bright", oledBrightPct);
-    preferences.putBool("alerts_beep", alertsBeepEnabled);
+    bool saved = preferences.putUChar("oled_sleep", oledSleepMode) == sizeof(oledSleepMode);
+    saved = preferences.putUChar("oled_bright", oledBrightPct) == sizeof(oledBrightPct) && saved;
+    saved = preferences.putBool("alerts_beep", alertsBeepEnabled) == sizeof(alertsBeepEnabled) && saved;
     preferences.end();
+    if (saved) {
+        settingsDirty = false;
+        settingsSavedUntilMs = millis() + SETTINGS_SAVED_NOTICE_MS;
+        Serial.println("Display settings saved to flash.");
+    } else {
+        Serial.println("Failed to save display settings to flash.");
+    }
+    return saved;
+}
+
+static void commitOledSettingsIfDirty() {
+    if (settingsDirty) {
+        saveOledSettings();
+    }
 }
 
 void saveApConfig() {
@@ -459,9 +475,9 @@ static void showSplashScreen() {
                        LOMHOR_SPLASH_BITMAP, LOMHOR_SPLASH_WIDTH,
                        LOMHOR_SPLASH_HEIGHT, SSD1306_WHITE);
     display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     display.getTextBounds(version, 0, 0, &textX, &textY, &textWidth, &textHeight);
-    display.setCursor(SCREEN_WIDTH - (int)textWidth, 0);
+    display.setCursor((int)SCREEN_WIDTH - (int)textWidth, 2);
     display.print(version);
     display.drawRoundRect(barX, barY, barWidth, barHeight, barRadius, SSD1306_WHITE);
 
@@ -536,7 +552,7 @@ void checkOledSleepTimeout() {
     }
 }
 
-// Change values in RAM only; call saveOledSettings() after hold-SELECT on Display screen.
+// Preview in RAM while adjusting; commit once editing ends or the screen is left.
 static void previewSettingsAdjust(int dir) {
     if (settingsEditField == 0) {
         int v = (int)oledSleepMode + dir;
@@ -2667,15 +2683,6 @@ void drawGpsScreen() {
     display.print(gps.satellites.value());
   }
 
-  unsigned long seconds = (millis() - startTime) / 1000;
-  unsigned long hours = seconds / 3600;
-  unsigned long minutes = (seconds % 3600) / 60;
-  char upBuf[16];
-  snprintf(upBuf, sizeof(upBuf), "%luh%lum", hours, minutes);
-  display.setCursor(4, 52);
-  display.print("Up ");
-  display.print(upBuf);
-
   drawScreenPageDots();
   display.display();
 }
@@ -2725,11 +2732,11 @@ void drawSettingsScreen() {
 
   display.setTextSize(1);
 
-  // Title row: light weight, unsaved = soft dot (not noisy asterisk)
+  // Title row: light weight, unsaved = soft dot.
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(mx, 16);
   display.print(F("Display"));
-  if (settingsDirty) {
+  if (settingsDirty && (long)(settingsSavedUntilMs - millis()) <= 0) {
     display.fillCircle(118, 19, 2, SSD1306_WHITE);
   }
 
@@ -2748,6 +2755,26 @@ void drawSettingsScreen() {
                   settingsAdjusting && settingsEditField == 2, F("Alerts"), alertVal);
 
   drawScreenPageDots();
+
+  if ((long)(settingsSavedUntilMs - millis()) > 0) {
+    const char *savedText = "SAVED !";
+    const int popupW = 68;
+    const int popupH = 24;
+    const int popupX = (SCREEN_WIDTH - popupW) / 2;
+    const int popupY = 25;
+    int16_t bx, by;
+    uint16_t bw, bh;
+
+    display.fillRoundRect(popupX, popupY, popupW, popupH, 4, SSD1306_WHITE);
+    display.drawRoundRect(popupX, popupY, popupW, popupH, 4, SSD1306_BLACK);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.getTextBounds(savedText, 0, 0, &bx, &by, &bw, &bh);
+    display.setCursor(popupX + (popupW - (int)bw) / 2,
+                      popupY + (popupH - (int)bh) / 2);
+    display.print(savedText);
+  }
+
   display.display();
 }
 
@@ -3086,6 +3113,7 @@ void loop() {
         if (currentScreen == 3 && settingsAdjusting) {
           previewSettingsAdjust(-1);
         } else if (currentScreen == 3) {
+          commitOledSettingsIfDirty();
           settingsAdjusting = false;
           currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
         } else {
@@ -3105,6 +3133,9 @@ void loop() {
         rightBtnLongSent = true;
         chargeScreenSuppressed = true;
         chargeScreenUiReady = false;
+        if (currentScreen == 3) {
+          commitOledSettingsIfDirty();
+        }
         currentScreen = 0;
         settingsAdjusting = false;
         popupType = PopupType::None;
@@ -3120,6 +3151,7 @@ void loop() {
         if (currentScreen == 3 && settingsAdjusting) {
           previewSettingsAdjust(1);
         } else if (currentScreen == 3) {
+          commitOledSettingsIfDirty();
           settingsAdjusting = false;
           currentScreen = (currentScreen + 1) % NUM_SCREENS;
         } else {
@@ -3143,6 +3175,7 @@ void loop() {
         lastUpBtnPress = millis();
         noteDisplayActivity();
         popupType = PopupType::None;
+        commitOledSettingsIfDirty();
         settingsAdjusting = false;
         settingsEditField = (uint8_t)((settingsEditField + 3 - 1) % 3);
         drawCurrentScreen();
@@ -3163,6 +3196,7 @@ void loop() {
         lastDownBtnPress = millis();
         noteDisplayActivity();
         popupType = PopupType::None;
+        commitOledSettingsIfDirty();
         settingsAdjusting = false;
         settingsEditField = (uint8_t)((settingsEditField + 1) % 3);
         drawCurrentScreen();
@@ -3182,7 +3216,6 @@ void loop() {
                  (millis() - selectBtnDownMs >= BTN_SETTINGS_HOLD_SAVE_MS)) {
         selectHoldSaveDone = true;
         saveOledSettings();
-        settingsDirty = false;
         settingsAdjusting = false;
         noteDisplayActivity();
         popupType = PopupType::None;
@@ -3196,7 +3229,12 @@ void loop() {
         noteDisplayActivity();
         popupType = PopupType::None;
         if (currentScreen == 3) {
-          settingsAdjusting = !settingsAdjusting;
+          if (settingsAdjusting) {
+            settingsAdjusting = false;
+            commitOledSettingsIfDirty();
+          } else {
+            settingsAdjusting = true;
+          }
         } else {
           currentScreen = 3;
           settingsAdjusting = false;
@@ -3210,6 +3248,14 @@ void loop() {
   if (popupType != PopupType::None && (long)(millis() - popupUntilMs) >= 0) {
     popupType = PopupType::None;
     drawCurrentScreen();
+  }
+
+  if (settingsSavedUntilMs != 0 && (long)(millis() - settingsSavedUntilMs) >= 0) {
+    settingsSavedUntilMs = 0;
+    if (currentScreen == 3 && popupType == PopupType::None &&
+        !(batteryCharging && !chargeScreenSuppressed)) {
+      drawCurrentScreen();
+    }
   }
 
   static unsigned long lastBatteryRead = 0;
