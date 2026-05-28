@@ -20,7 +20,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x03;     // Default Node ID
+uint8_t MY_ADDL = 0x01;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -216,19 +216,31 @@ void syncOnlineNodesFromRegistry() {
     onlineNodes = (int)countOnlineNearbyNodes(millis());
 }
 
+static int16_t e22RssiByteToDbm(uint8_t rawRssi) {
+    return (int16_t)rawRssi - 256;
+}
+
+static int rssiDbmToSignalPercent(int16_t rssiDbm) {
+    if (rssiDbm <= -250) return 0;
+    const int16_t minUsableDbm = -140;
+    const int16_t maxStrongDbm = -40;
+    int pct = ((int32_t)(rssiDbm - minUsableDbm) * 100) / (maxStrongDbm - minUsableDbm);
+    return constrain(pct, 0, 100);
+}
+
 // Message log
 #define MAX_LOG_ENTRIES 20
 struct LogEntry {
     unsigned long timestamp;
     String direction;
-    int8_t rssi;
+    int16_t rssi;
     String address;
     String message;
 };
 LogEntry messageLog[MAX_LOG_ENTRIES];
 int logIndex = 0;
 
-void addLogEntry(String direction, int8_t rssi, String addr, String msg) {
+void addLogEntry(String direction, int16_t rssi, String addr, String msg) {
     messageLog[logIndex].timestamp = millis();
     messageLog[logIndex].direction = direction;
     messageLog[logIndex].rssi = rssi;
@@ -1230,13 +1242,14 @@ void checkIncoming() {
     }
 
     receivedCount++;
+    const int16_t rxRssiDbm = e22RssiByteToDbm(rc.rssi);
     lastReceived = payload;
-    lastRssiSignal = (int8_t)rc.rssi;
+    lastRssiSignal = rxRssiDbm;
     statusMsg = "RX OK";
 
     if (rxRaw.startsWith("MSG3|") || rxRaw.startsWith("MSG2|") || rxRaw.startsWith("MSG|")) {
         noteDisplayActivity();
-        addLogEntry("RX", (int8_t)rc.rssi, logAddr, payload);
+        addLogEntry("RX", rxRssiDbm, logAddr, payload);
         if (alertsBeepEnabled) {
             buzzerAlertNewChatMessage();
         }
@@ -1300,7 +1313,7 @@ void checkIncoming() {
             int16_t chVal   = parseHex8(chHex);
             bool isRep = (role.length() > 0 && role.charAt(0) == 'R');
             if (addrVal >= 0 && netVal >= 0 && chVal >= 0) {
-                upsertNearbyNode((uint16_t)addrVal, (uint8_t)netVal, (uint8_t)chVal, (int8_t)rc.rssi, isRep,
+                upsertNearbyNode((uint16_t)addrVal, (uint8_t)netVal, (uint8_t)chVal, rxRssiDbm, isRep,
                                  csIn, hasFix, latIn, lngIn);
             }
         }
@@ -2397,6 +2410,15 @@ static void drawTinySignalGlyph(int x, int y) {
   display.drawFastVLine(x + 4, y, 7, SSD1306_WHITE);
 }
 
+static void drawRssiProgressBar(int x, int y, int w, int h, int signalPct) {
+  const int fillW = ((w - 2) * constrain(signalPct, 0, 100)) / 100;
+
+  display.drawRect(x, y, w, h, SSD1306_WHITE);
+  if (fillW > 0) {
+    display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_WHITE);
+  }
+}3
+
 // Bottom page dots: active filled, others hollow for clearer hierarchy.
 static void drawScreenPageDots() {
   const int n = NUM_SCREENS;
@@ -2505,22 +2527,17 @@ void drawStatusScreen() {
   display.print(batteryVoltage, 2);
   display.print(" V");
   
-  const int chUtil = 0;
+  const int signalPct = rssiDbmToSignalPercent(lastRssiSignal);
   display.setCursor(4, 37);
-  display.print("CH");
-  const int barX = 22;
-  const int barY = 37;
-  const int barWidth = 74;
-  display.drawRoundRect(barX, barY, barWidth, 7, 2, SSD1306_WHITE);
-  if (chUtil > 0) {
-    int fillWidth = (chUtil * (barWidth - 4)) / 100;
-    if (fillWidth > 0) {
-      display.fillRoundRect(barX + 2, barY + 2, fillWidth, 3, 1, SSD1306_WHITE);
-    }
+  display.print("RSSI");
+  drawRssiProgressBar(34, 37, 48, 7, signalPct);
+  display.setCursor(84, 37);
+  if (lastRssiSignal <= -250) {
+    display.print("--dBm");
+  } else {
+    display.print(lastRssiSignal);
+    display.print("dBm");
   }
-  display.setCursor(100, 37);
-  display.print(chUtil);
-  display.print("%");
   
   {
     String line = ellipsizeMaxChars(ssid_AP, 16);

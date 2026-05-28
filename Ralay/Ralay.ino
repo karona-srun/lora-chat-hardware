@@ -11,12 +11,13 @@
 #include <TinyGPS++.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <mbedtls/base64.h>
 #include <esp_system.h>
 #include "esp_sleep.h"
 
 // ----------------------------- WiFi credentials -------------------------------
-const char* ssid_AP    = "LMRalay-1";
+const char* ssid_AP    = "LMRalay-3";
 const char* password_AP = "12345678";
 
 // ----------------------------- Relay configuration ----------------------------
@@ -59,6 +60,7 @@ HardwareSerial gpsSerial(1);
 LoRa_E22 e22(PIN_E22_TX, PIN_E22_RX, &Serial2, PIN_AUX, PIN_M0, PIN_M1, UART_BPS_RATE_9600, SERIAL_8N1);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 WebServer server(80);
+Preferences preferences;
 
 bool     oledReady     = false;
 uint8_t  oledI2cAddress = SCREEN_ADDRESS;
@@ -74,6 +76,36 @@ double   gpsLat       = 0.0;
 double   gpsLng       = 0.0;
 uint32_t gpsSatellites = 0;
 char     gpsTimeUtc[16] = "--:--:--";
+
+// Pin button
+// #define BTN_LEFT_PIN    32
+// #define BTN_RIGHT_PIN   23
+// #define BTN_UP_PIN      5 
+// #define BTN_DOWN_PIN    13 
+// #define BTN_SELECT_PIN  14
+
+// New Pin button
+#define BTN_LEFT_PIN    13
+#define BTN_RIGHT_PIN   5
+#define BTN_UP_PIN      32
+#define BTN_DOWN_PIN    23 
+#define BTN_SELECT_PIN  14
+
+// OLED pages and persisted display settings
+#define NUM_SCREENS 3
+uint8_t currentScreen = 0;      // 0=status, 1=GPS, 2=settings
+uint8_t oledSleepMode = 3;      // 0=10s, 1=40s, 2=1min, 3=never
+uint8_t oledBrightPct = 90;     // 0..100
+bool oledDisplayOff = false;
+uint32_t lastDisplayActivityMs = 0;
+uint8_t settingsField = 0;      // 0=sleep, 1=brightness
+bool settingsAdjusting = false;
+bool settingsDirty = false;
+uint32_t settingsSavedUntilMs = 0;
+
+const uint32_t BTN_DEBOUNCE_MS = 35;
+const uint32_t BTN_SETTINGS_HOLD_SAVE_MS = 700;
+const uint32_t SETTINGS_SAVED_NOTICE_MS = 1500;
 
 // =============================================================================
 // FIX 1: Fixed-size char arrays instead of Arduino String for log entries.
@@ -246,6 +278,9 @@ void addLogEntry(const char* direction, int8_t rssi,
 // =============================================================================
 
 void drawDisplay();
+static void applyOledBrightness();
+static void noteDisplayActivity();
+static void wakeOledIfNeeded();
 
 static bool i2cAddressResponds(uint8_t address) {
     Wire.beginTransmission(address);
@@ -270,6 +305,7 @@ static bool initOled() {
             display.setRotation(2);
             display.clearDisplay();
             display.display();
+            applyOledBrightness();
             Serial.printf("[OLED] OK at 0x%02X on SDA=%d SCL=%d\n", addr, OLED_SDA, OLED_SCL);
             return true;
         }
@@ -344,6 +380,76 @@ void getUptime(char* buf, size_t len) {
     snprintf(buf, len, "%uh %um", (unsigned)hours, (unsigned)minutes);
 }
 
+static const char* oledSleepLabel(uint8_t mode) {
+    switch (mode) {
+        case 0: return "10s";
+        case 1: return "40s";
+        case 2: return "1m";
+        default: return "Never";
+    }
+}
+
+static uint32_t oledSleepTimeoutMs() {
+    switch (oledSleepMode) {
+        case 0: return 10000UL;
+        case 1: return 40000UL;
+        case 2: return 60000UL;
+        default: return 0;
+    }
+}
+
+static void loadRelayUiSettings() {
+    preferences.begin("relay-ui", true);
+    oledSleepMode = preferences.getUChar("oled_sleep", oledSleepMode);
+    oledBrightPct = preferences.getUChar("oled_bright", oledBrightPct);
+    preferences.end();
+    if (oledSleepMode > 3) oledSleepMode = 3;
+    if (oledBrightPct > 100) oledBrightPct = 100;
+}
+
+static bool saveRelayUiSettings() {
+    preferences.begin("relay-ui", false);
+    bool saved = preferences.putUChar("oled_sleep", oledSleepMode) == sizeof(oledSleepMode);
+    saved = preferences.putUChar("oled_bright", oledBrightPct) == sizeof(oledBrightPct) && saved;
+    preferences.end();
+    if (saved) {
+        settingsDirty = false;
+        settingsSavedUntilMs = millis() + SETTINGS_SAVED_NOTICE_MS;
+        Serial.println("[OLED] Display settings saved.");
+    } else {
+        Serial.println("[OLED] Display settings save failed.");
+    }
+    return saved;
+}
+
+static void applyOledBrightness() {
+    if (!oledReady) return;
+    uint8_t contrast = (uint8_t)((uint32_t)oledBrightPct * 255UL / 100UL);
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command(contrast);
+}
+
+static void noteDisplayActivity() {
+    lastDisplayActivityMs = millis();
+}
+
+static void wakeOledIfNeeded() {
+    if (!oledDisplayOff || !oledReady) return;
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    oledDisplayOff = false;
+    applyOledBrightness();
+    drawDisplay();
+}
+
+static void checkOledSleepTimeout() {
+    if (!oledReady || oledDisplayOff || settingsAdjusting) return;
+    uint32_t timeoutMs = oledSleepTimeoutMs();
+    if (timeoutMs != 0 && (uint32_t)(millis() - lastDisplayActivityMs) >= timeoutMs) {
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
+        oledDisplayOff = true;
+    }
+}
+
 void updateGPS() {
     while (gpsSerial.available() > 0) {
         gps.encode(gpsSerial.read());
@@ -362,43 +468,303 @@ void updateGPS() {
     }
 }
 
+
+// ────────────────────────────────────────────────
+// Draw header with rounded corners background (radius ~2px)
+// ────────────────────────────────────────────────
+void drawHeader() {
+  // Draw filled rectangle with rounded corners (radius 1px)
+  // Clear full top band to avoid old pixels after long uptime
+  display.fillRect(0, 0, SCREEN_WIDTH, 13, SSD1306_BLACK);
+  // Then filled rounded area across full width
+  display.fillRoundRect(0, 0, SCREEN_WIDTH, 13, 3, SSD1306_WHITE);
+  // Optional: white outline on top (makes it look sharper)
+  display.drawRoundRect(0, 0, SCREEN_WIDTH, 13, 3, SSD1306_WHITE);
+  
+  // Draw text in inverse (black on white)
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+
+  // Relay identifies its access point in the header instead of showing battery state.
+  display.setCursor(6, 3);
+  display.print(ssid_AP);
+
+  // GPS time on the right; displays placeholders until GPS time is valid.
+  display.setCursor(76, 3);
+  display.print(gpsTimeUtc);
+  
+  // Reset text color for rest of screen
+  display.setTextColor(SSD1306_WHITE);
+}
+
 // =============================================================================
 // OLED — uses fixed-size stack buffers, no String
 // =============================================================================
 
-void drawDisplay() {
-    if (!oledReady || inSleepMode) return;
+static void drawScreenDots() {
+    const int spacing = 10;
+    const int startX = (SCREEN_WIDTH - (NUM_SCREENS - 1) * spacing) / 2;
+    for (uint8_t i = 0; i < NUM_SCREENS; i++) {
+        int x = startX + i * spacing;
+        if (i == currentScreen) {
+            display.fillCircle(x, 61, 2, SSD1306_WHITE);
+        } else {
+            display.drawCircle(x, 61, 1, SSD1306_WHITE);
+        }
+    }
+}
+
+static void drawStatusScreen() {
     display.clearDisplay();
+    drawHeader();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
 
     char buf[32];
 
-    display.setCursor(0, 0);
-    snprintf(buf, sizeof(buf), "=== %s ===", ssid_AP);
-    display.println(buf);
-
-    display.setCursor(0, 12);
+    display.setCursor(0, 16);
     snprintf(buf, sizeof(buf), "IP: %s", WiFi.softAPIP().toString().c_str());
     display.print(buf);
 
-    display.setCursor(0, 22);
+    display.setCursor(0, 26);
     display.print("Addr: 0xFF/0xFF");
 
-    display.setCursor(0, 32);
-    snprintf(buf, sizeof(buf), "CH:0x%02X", COMMON_CHAN);
+    display.setCursor(0, 36);
+    snprintf(buf, sizeof(buf), "CH:0x%02X  NET:0x%02X", COMMON_CHAN, COMMON_NETID);
     display.print(buf);
 
-    display.setCursor(0, 42);
-    snprintf(buf, sizeof(buf), "GPS:%s S:%u",
-             gpsHasFix ? "FIX " : "NOFIX", (unsigned)gpsSatellites);
-    display.print(buf);
-
-    display.setCursor(0, 52);
+    display.setCursor(0, 46);
     snprintf(buf, sizeof(buf), "Relayed: %u", (unsigned)relayCount);
     display.print(buf);
 
+    drawScreenDots();
     display.display();
+}
+
+static void drawGpsScreen() {
+    display.clearDisplay();
+    drawHeader();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    char buf[32];
+    display.setCursor(0, 16);
+    snprintf(buf, sizeof(buf), "GPS: %s  SAT:%u",
+             gpsHasFix ? "FIX" : "SEARCH", (unsigned)gpsSatellites);
+    display.print(buf);
+
+    display.setCursor(0, 27);
+    if (gpsHasFix) {
+        snprintf(buf, sizeof(buf), "Lat: %.5f", gpsLat);
+        display.print(buf);
+        display.setCursor(0, 38);
+        snprintf(buf, sizeof(buf), "Lng: %.5f", gpsLng);
+        display.print(buf);
+    } else {
+        display.print("Waiting location...");
+        display.setCursor(0, 38);
+        display.print("Move outdoors for fix");
+    }
+
+    display.setCursor(0, 49);
+    snprintf(buf, sizeof(buf), "UTC: %s", gpsTimeUtc);
+    display.print(buf);
+    drawScreenDots();
+    display.display();
+}
+
+static void drawSettingsScreen() {
+    display.clearDisplay();
+    drawHeader();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 16);
+    display.print("Display");
+    if (settingsDirty) display.fillCircle(116, 19, 2, SSD1306_WHITE);
+
+    const int rowX = 6;
+    const int rowW = SCREEN_WIDTH - 12;
+    const int rowH = 12;
+    const int row1Y = 27;
+    const int row2Y = 40;
+    char value[10];
+
+    snprintf(value, sizeof(value), "%s", oledSleepLabel(oledSleepMode));
+    if (settingsAdjusting && settingsField == 0) {
+        display.fillRoundRect(rowX, row1Y, rowW, rowH, 3, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+        display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(rowX + 5, row1Y + 2);
+    display.print(settingsField == 0 ? "* " : " ");
+    display.print("Sleep");
+    display.setCursor(84, row1Y + 2);
+    display.print(value);
+
+    snprintf(value, sizeof(value), "%u%%", (unsigned)oledBrightPct);
+    if (settingsAdjusting && settingsField == 1) {
+        display.fillRoundRect(rowX, row2Y, rowW, rowH, 3, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+        display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(rowX + 5, row2Y + 2);
+    display.print(settingsField == 1 ? "* " : " ");
+    display.print("Brightness");
+    display.setCursor(92, row2Y + 2);
+    display.print(value);
+
+    display.setTextColor(SSD1306_WHITE);
+    drawScreenDots();
+    if ((int32_t)(settingsSavedUntilMs - millis()) > 0) {
+        const char* text = "SAVED !";
+        const int x = 31;
+        const int y = 27;
+        display.fillRoundRect(x, y, 66, 25, 4, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.setCursor(x + 12, y + 9);
+        display.print(text);
+    }
+    display.display();
+}
+
+void drawDisplay() {
+    if (!oledReady || inSleepMode || oledDisplayOff) return;
+    if (currentScreen == 0) {
+        drawStatusScreen();
+    } else if (currentScreen == 1) {
+        drawGpsScreen();
+    } else {
+        drawSettingsScreen();
+    }
+}
+
+static void changeSettingValue(int direction) {
+    if (settingsField == 0) {
+        int mode = (int)oledSleepMode + direction;
+        if (mode < 0) mode = 3;
+        if (mode > 3) mode = 0;
+        oledSleepMode = (uint8_t)mode;
+    } else {
+        int brightness = (int)oledBrightPct + direction * 5;
+        oledBrightPct = (uint8_t)constrain(brightness, 0, 100);
+        applyOledBrightness();
+    }
+    settingsDirty = true;
+}
+
+static void processDisplayButtons() {
+    static bool previousLeft = false;
+    static bool previousRight = false;
+    static bool previousUp = false;
+    static bool previousDown = false;
+    static bool previousSelect = false;
+    static bool waitForRelease = false;
+    static bool selectLongDone = false;
+    static uint32_t selectStartedAt = 0;
+    static uint32_t lastPressAt = 0;
+
+    bool left = digitalRead(BTN_LEFT_PIN) == LOW;
+    bool right = digitalRead(BTN_RIGHT_PIN) == LOW;
+    bool up = digitalRead(BTN_UP_PIN) == LOW;
+    bool down = digitalRead(BTN_DOWN_PIN) == LOW;
+    bool select = digitalRead(BTN_SELECT_PIN) == LOW;
+    bool anyPressed = left || right || up || down || select;
+    uint32_t now = millis();
+
+    if (oledDisplayOff && anyPressed) {
+        wakeOledIfNeeded();
+        noteDisplayActivity();
+        waitForRelease = true;
+    }
+    if (waitForRelease) {
+        if (!anyPressed) waitForRelease = false;
+        previousLeft = left;
+        previousRight = right;
+        previousUp = up;
+        previousDown = down;
+        previousSelect = select;
+        return;
+    }
+
+    bool canPress = (uint32_t)(now - lastPressAt) >= BTN_DEBOUNCE_MS;
+    if (canPress && left && !previousLeft) {
+        lastPressAt = now;
+        noteDisplayActivity();
+        lastActivityMs = now;
+        if (currentScreen == 2 && settingsAdjusting) {
+            changeSettingValue(-1);
+        } else {
+            if (currentScreen == 2 && settingsDirty) saveRelayUiSettings();
+            currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
+            settingsAdjusting = false;
+        }
+        drawDisplay();
+    }
+    if (canPress && right && !previousRight) {
+        lastPressAt = now;
+        noteDisplayActivity();
+        lastActivityMs = now;
+        if (currentScreen == 2 && settingsAdjusting) {
+            changeSettingValue(1);
+        } else {
+            if (currentScreen == 2 && settingsDirty) saveRelayUiSettings();
+            currentScreen = (currentScreen + 1) % NUM_SCREENS;
+            settingsAdjusting = false;
+        }
+        drawDisplay();
+    }
+    if (canPress && up && !previousUp && currentScreen == 2 && !settingsAdjusting) {
+        lastPressAt = now;
+        noteDisplayActivity();
+        lastActivityMs = now;
+        settingsField = settingsField == 0 ? 1 : 0;
+        drawDisplay();
+    }
+    if (canPress && down && !previousDown && currentScreen == 2 && !settingsAdjusting) {
+        lastPressAt = now;
+        noteDisplayActivity();
+        lastActivityMs = now;
+        settingsField = settingsField == 0 ? 1 : 0;
+        drawDisplay();
+    }
+
+    if (select && !previousSelect) {
+        selectStartedAt = now;
+        selectLongDone = false;
+        noteDisplayActivity();
+        lastActivityMs = now;
+    } else if (select && !selectLongDone && currentScreen == 2 &&
+               (uint32_t)(now - selectStartedAt) >= BTN_SETTINGS_HOLD_SAVE_MS) {
+        selectLongDone = true;
+        settingsAdjusting = false;
+        saveRelayUiSettings();
+        noteDisplayActivity();
+        drawDisplay();
+    } else if (!select && previousSelect && !selectLongDone &&
+               (uint32_t)(now - selectStartedAt) >= BTN_DEBOUNCE_MS) {
+        noteDisplayActivity();
+        lastActivityMs = now;
+        if (currentScreen == 2) {
+            if (settingsAdjusting) {
+                settingsAdjusting = false;
+                if (settingsDirty) saveRelayUiSettings();
+            } else {
+                settingsAdjusting = true;
+            }
+        } else {
+            currentScreen = 2;
+            settingsAdjusting = false;
+        }
+        drawDisplay();
+    }
+
+    previousLeft = left;
+    previousRight = right;
+    previousUp = up;
+    previousDown = down;
+    previousSelect = select;
 }
 
 // =============================================================================
@@ -828,6 +1194,118 @@ static const char* resetReasonText(esp_reset_reason_t reason) {
     }
 }
 
+
+// Full splash adaptation for a 128x64 monochrome OLED.
+static const uint8_t LOMHOR_SPLASH_BITMAP[] PROGMEM = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xff, 0xf0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x80, 0xf8, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x7f, 0x3c, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0xff, 0xc8, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x03, 0x80, 0xe0, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xb8, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xb8, 0x00, 0x00, 0x00, 0xe3, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf1, 0xc3, 0x81, 0xfc, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x63, 0xc7, 0xc7, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcf, 0xef, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x03, 0xce, 0x6f, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xc3, 0xce, 0xef, 0xfe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe3, 0xc7, 0xcf, 0xbe, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xf3, 0xc7, 0xcf, 0x3e, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0xfb, 0xc7, 0xcf, 0x3e, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfd, 0xff, 0xc7, 0xdf, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xc7, 0xff, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xce, 0xff, 0xc7, 0xff, 0x3e, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x7f, 0xc7, 0xff, 0x3e, 0x7e, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x3f, 0xc7, 0xfe, 0x3e, 0x7c, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x07, 0xf8, 0x1c, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const int LOMHOR_SPLASH_WIDTH = 128;
+static const int LOMHOR_SPLASH_HEIGHT = 64;
+
+static void showSplashScreen() {
+    if (!oledReady) return;
+
+    const unsigned long splashDurationMs = 2000UL;
+    const char *version = "v0.0.12";
+    const int barX = 0;
+    const int barY = SCREEN_HEIGHT - 4;
+    const int barWidth = SCREEN_WIDTH;
+    const int barHeight = 4;
+    const int barRadius = 3;
+    int16_t textX, textY;
+    uint16_t textWidth, textHeight;
+
+    display.clearDisplay();
+    display.drawBitmap((SCREEN_WIDTH - LOMHOR_SPLASH_WIDTH),
+                       (SCREEN_HEIGHT - LOMHOR_SPLASH_HEIGHT),
+                       LOMHOR_SPLASH_BITMAP, LOMHOR_SPLASH_WIDTH,
+                       LOMHOR_SPLASH_HEIGHT, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.getTextBounds(version, 0, 0, &textX, &textY, &textWidth, &textHeight);
+    display.setCursor((int)SCREEN_WIDTH - (int)textWidth, 2);
+    display.print(version);
+    display.drawRoundRect(barX, barY, barWidth, barHeight, barRadius, SSD1306_WHITE);
+
+    unsigned long startedAt = millis();
+    unsigned long elapsed = 0;
+    while (elapsed < splashDurationMs) {
+        elapsed = millis() - startedAt;
+        int fillWidth = (int)((unsigned long)(barWidth - 2) *
+                              min(elapsed, splashDurationMs) / splashDurationMs);
+        if (fillWidth > 0) {
+            display.fillRoundRect(barX + 1, barY + 1, fillWidth, barHeight - 2,
+                                  barRadius, SSD1306_WHITE);
+        }
+        display.display();
+        delay(40);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(100);
@@ -837,11 +1315,18 @@ void setup() {
 
     startTime = millis();
     lastActivityMs = millis();
+    lastDisplayActivityMs = millis();
     initLog();
+    loadRelayUiSettings();
 
     pinMode(PIN_AUX, INPUT);
     pinMode(PIN_M0,  OUTPUT);
     pinMode(PIN_M1,  OUTPUT);
+    pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
+    pinMode(BTN_RIGHT_PIN, INPUT_PULLUP);
+    pinMode(BTN_UP_PIN, INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+    pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
 
     WiFi.mode(WIFI_AP);
     WiFi.setSleep(false);
@@ -862,7 +1347,7 @@ void setup() {
     if (oledReady) {
         showBootMessage("LoRa Relay", "Configuring...");
     }
-
+    showSplashScreen();
     if (!e22.begin()) {
         Serial.println("[E22] FAILED");
         showBootMessage("E22 FAILED", "Web UI still active");
@@ -873,7 +1358,6 @@ void setup() {
         Serial.println("[ERROR] Relay config failed.");
         showBootMessage("CONFIG FAILED", "Check E22 AUX/pins");
     }
-
     drawDisplay();
 }
 
@@ -904,6 +1388,8 @@ void loop() {
 
     updateGPS();
     server.handleClient();
+    processDisplayButtons();
+    checkOledSleepTimeout();
 
     if (relayReady) {
         if (e22.available() > 0) {
@@ -921,5 +1407,10 @@ void loop() {
     if ((uint32_t)(millis() - lastDraw) >= 1000UL) {
         lastDraw = millis();
         drawDisplay();
+    }
+
+    if (settingsSavedUntilMs != 0 && (int32_t)(millis() - settingsSavedUntilMs) >= 0) {
+        settingsSavedUntilMs = 0;
+        if (currentScreen == 2) drawDisplay();
     }
 }
