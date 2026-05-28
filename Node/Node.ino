@@ -2411,13 +2411,14 @@ static void drawTinySignalGlyph(int x, int y) {
 }
 
 static void drawRssiProgressBar(int x, int y, int w, int h, int signalPct) {
+  const int radius = 3;
   const int fillW = ((w - 2) * constrain(signalPct, 0, 100)) / 100;
 
-  display.drawRect(x, y, w, h, SSD1306_WHITE);
+  display.drawRoundRect(x, y, w, h, radius, SSD1306_WHITE);
   if (fillW > 0) {
-    display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_WHITE);
+    display.fillRoundRect(x + 1, y + 1, fillW, h - 2, 5, SSD1306_WHITE);
   }
-}3
+}
 
 // Bottom page dots: active filled, others hollow for clearer hierarchy.
 static void drawScreenPageDots() {
@@ -2533,7 +2534,7 @@ void drawStatusScreen() {
   drawRssiProgressBar(34, 37, 48, 7, signalPct);
   display.setCursor(84, 37);
   if (lastRssiSignal <= -250) {
-    display.print("--dBm");
+    display.print(" -dBm");
   } else {
     display.print(lastRssiSignal);
     display.print("dBm");
