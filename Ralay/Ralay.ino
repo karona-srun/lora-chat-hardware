@@ -17,7 +17,7 @@
 #include "esp_sleep.h"
 
 // ----------------------------- WiFi credentials -------------------------------
-const char* ssid_AP    = "LMRalay-3";
+const char* ssid_AP    = "LMRalay-2";
 const char* password_AP = "12345678";
 
 // ----------------------------- Relay configuration ----------------------------
@@ -77,18 +77,11 @@ double   gpsLng       = 0.0;
 uint32_t gpsSatellites = 0;
 char     gpsTimeUtc[16] = "--:--:--";
 
-// Pin button
-// #define BTN_LEFT_PIN    32
-// #define BTN_RIGHT_PIN   23
-// #define BTN_UP_PIN      5 
-// #define BTN_DOWN_PIN    13 
-// #define BTN_SELECT_PIN  14
-
 // New Pin button
-#define BTN_LEFT_PIN    13
-#define BTN_RIGHT_PIN   5
-#define BTN_UP_PIN      32
-#define BTN_DOWN_PIN    23 
+#define BTN_LEFT_PIN    5
+#define BTN_RIGHT_PIN   13
+#define BTN_UP_PIN      23
+#define BTN_DOWN_PIN    32 
 #define BTN_SELECT_PIN  14
 
 // OLED pages and persisted display settings
@@ -1347,6 +1340,7 @@ void setup() {
     if (oledReady) {
         showBootMessage("LoRa Relay", "Configuring...");
     }
+    display.setRotation(0);
     showSplashScreen();
     if (!e22.begin()) {
         Serial.println("[E22] FAILED");
