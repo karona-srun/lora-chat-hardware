@@ -61,13 +61,6 @@ String defaultApSsid() {
 // Select opens Display settings from other screens; on Display screen, Select toggles edit.
 // All pressed = LOW.
 
-// Old
-// #define BTN_LEFT_PIN    23
-// #define BTN_RIGHT_PIN   32
-// #define BTN_UP_PIN      5 
-// #define BTN_DOWN_PIN    14
-// #define BTN_SELECT_PIN  13
-
 // New Pin
 #define BTN_LEFT_PIN    32
 #define BTN_RIGHT_PIN   23
@@ -110,7 +103,6 @@ unsigned long lastUpBtnPress = 0;
 unsigned long lastDownBtnPress = 0;
 unsigned long lastSelectBtnPress = 0;
 bool rightBtnHeld = false;
-bool rightBtnLongSent = false;
 unsigned long rightBtnDownMs = 0;
 bool chargeScreenSuppressed = false;
 static bool chargeScreenUiReady = false;  // true after full charging screen paint (partial updates after)
@@ -123,7 +115,7 @@ unsigned long popupUntilMs = 0;
 
 const bool AUTO_GPS_ENABLED = true;
 const unsigned long AUTO_GPS_INTERVAL_MS = 5000UL;
-const unsigned long BTN_RIGHT_LONG_PRESS_MS = 3000UL;
+const unsigned long BTN_CHARGE_SELECT_LONG_PRESS_MS = 3000UL;
 // Display screen: hold SELECT this long to explicitly write settings to flash
 const unsigned long BTN_SETTINGS_HOLD_SAVE_MS = 700UL;
 const unsigned long SETTINGS_SAVED_NOTICE_MS = 1500UL;
@@ -548,6 +540,17 @@ void tryWakeOledFromSleep() {
     oledHardwarePower(true);
     oledDisplayOff = false;
     applyOledBrightness();
+    drawCurrentScreen();
+}
+
+static void showChargingScreenIfSleeping() {
+    if (!batteryCharging || !oledDisplayOff) return;
+    chargeScreenSuppressed = false;
+    chargeScreenUiReady = false;
+    oledHardwarePower(true);
+    oledDisplayOff = false;
+    applyOledBrightness();
+    noteDisplayActivity();
     drawCurrentScreen();
 }
 
@@ -2478,9 +2481,15 @@ void drawHeader() {
   }
 
   // Percentage next to icon (refreshed from BAT_READER)
-  display.setCursor(batX + 7, 3);
-  display.print(batteryPercent);
-  display.print("%");
+  if(batteryCharging){
+    display.setCursor(batX + 7, 3);
+    display.print(" ");
+    display.print(" ");
+  }else{
+    display.setCursor(batX + 7, 3);
+    display.print(batteryPercent);
+    display.print("%");
+  }
   // if (batteryCharging) {
   //   display.print("+");  // charging indicator
   // }
@@ -2525,8 +2534,13 @@ void drawStatusScreen() {
   display.print(gps.satellites.value());
   display.print(" sats");
   display.setCursor(82, 26);
-  display.print(batteryVoltage, 2);
-  display.print(" V");
+  if(batteryCharging){
+    display.print("--");
+    display.print(" ");
+  }else{
+    display.print(batteryVoltage, 2);
+    display.print(" V");
+  }
   
   const int signalPct = rssiDbmToSignalPercent(lastRssiSignal);
   display.setCursor(4, 37);
@@ -2817,48 +2831,40 @@ static void drawChargingTitle(unsigned ndots) {
   display.print(titleLine);
 }
 
-static void drawChargingBatteryAnim(int inX, int inY, int inW, int inH, int fillW, int marchHx) {
-  display.fillRect(inX, inY, inW, inH, SSD1306_BLACK);
-  if (fillW > 0) {
-    display.fillRect(inX, inY, fillW, inH, SSD1306_WHITE);
-    if (fillW >= 4 && marchHx >= inX && marchHx < inX + fillW) {
-      display.drawFastVLine(marchHx, inY, inH, SSD1306_BLACK);
-    }
+static void drawChargingBatteryAnim(int inX, int inY, int cellW, int cellH, int gap, int activeCells) {
+  const int cellCount = 5;
+  const int clearW = (cellCount * cellW) + ((cellCount - 1) * gap);
+
+  display.fillRect(inX, inY, clearW, cellH, SSD1306_BLACK);
+  activeCells = constrain(activeCells, 0, cellCount);
+  for (int i = 0; i < activeCells; i++) {
+    const int cellX = inX + (i * (cellW + gap));
+    display.fillRoundRect(cellX, inY, cellW, cellH, 1, SSD1306_WHITE);
   }
+}
+
+static void drawChargingBatteryShell(int batX, int batY, int bodyW, int bodyH) {
+  display.drawRoundRect(batX, batY, bodyW, bodyH, 2, SSD1306_WHITE);
+  display.fillRoundRect(batX + bodyW + 1, batY + 3, 2, 5, 1, SSD1306_WHITE);
 }
 
 void drawChargingScreen(bool fullRedraw) {
   static unsigned lastDots = 99;
-  static int lastFillW = -1;
-  static int lastMarchHx = -999;
+  static int lastActiveCells = -1;
 
-  const int batX = 46;
-  const int batY = 30;
-  const int bodyW = 30;
-  const int bodyH = 12;
-  const int inX = batX + 2;
-  const int inY = batY + 2;
-  const int inW = bodyW - 4;
-  const int inH = bodyH - 4;
+  const int bodyW = 26;
+  const int bodyH = 11;
+  const int batX = (SCREEN_WIDTH - bodyW - 3) / 2;
+  const int batY = 39;
+  const int cellW = 2;
+  const int cellH = 5;
+  const int gap = 2;
+  const int inX = batX + 4;
+  const int inY = batY + 3;
 
   const unsigned ndots = (unsigned)(millis() / 500UL) % 4U;
 
-  const unsigned long breathMs = 4400UL;
-  unsigned long ph = millis() % breathMs;
-  int fillW;
-  if (ph < breathMs / 2)
-    fillW = (int)((unsigned long)inW * ph / (breathMs / 2));
-  else
-    fillW = (int)((unsigned long)inW * (breathMs - ph) / (breathMs / 2));
-  fillW = constrain(fillW, 1, inW);
-
-  int marchHx = -1;
-  if (fillW >= 4) {
-    const int nSeg = 5;
-    int segPx = max(1, fillW / nSeg);
-    int march = (int)((millis() / 450UL) % (unsigned long)(nSeg + 1));
-    marchHx = constrain(inX + march * segPx, inX, inX + fillW - 2);
-  }
+  const int activeCells = 1 + (int)((millis() / 450UL) % 5UL);
 
   bool needDisplay = false;
 
@@ -2867,17 +2873,15 @@ void drawChargingScreen(bool fullRedraw) {
     // drawHeader();
     // drawScreenDivider();
     drawChargingTitle(ndots);
-    display.drawRoundRect(batX, batY, bodyW, bodyH, 2, SSD1306_WHITE);
-    display.fillRect(batX + bodyW, batY + 4, 2, 4, SSD1306_WHITE);
-    drawChargingBatteryAnim(inX, inY, inW, inH, fillW, marchHx);
+    drawChargingBatteryShell(batX, batY, bodyW, bodyH);
+    drawChargingBatteryAnim(inX, inY, cellW, cellH, gap, activeCells);
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(4, 50);
-    // display.print(F("Hold RIGHT 3s: Home"));
+    // display.print(F("Hold SELECT 3s: Home"));
     chargeScreenUiReady = true;
     lastDots = ndots;
-    lastFillW = fillW;
-    lastMarchHx = marchHx;
+    lastActiveCells = activeCells;
     needDisplay = true;
   } else {
     if (ndots != lastDots) {
@@ -2885,10 +2889,9 @@ void drawChargingScreen(bool fullRedraw) {
       lastDots = ndots;
       needDisplay = true;
     }
-    if (fillW != lastFillW || marchHx != lastMarchHx) {
-      drawChargingBatteryAnim(inX, inY, inW, inH, fillW, marchHx);
-      lastFillW = fillW;
-      lastMarchHx = marchHx;
+    if (activeCells != lastActiveCells) {
+      drawChargingBatteryAnim(inX, inY, cellW, cellH, gap, activeCells);
+      lastActiveCells = activeCells;
       needDisplay = true;
     }
   }
@@ -3087,6 +3090,7 @@ void loop() {
   }
 
   checkOledSleepTimeout();
+  showChargingScreenIfSleeping();
 
   if (nodeReady) {
       checkIncoming();
@@ -3145,24 +3149,11 @@ void loop() {
     if (rightLow) {
       if (!rightBtnHeld) {
         rightBtnHeld = true;
-        rightBtnLongSent = false;
         rightBtnDownMs = millis();
-      } else if (!rightBtnLongSent && (millis() - rightBtnDownMs >= BTN_RIGHT_LONG_PRESS_MS)) {
-        rightBtnLongSent = true;
-        chargeScreenSuppressed = true;
-        chargeScreenUiReady = false;
-        if (currentScreen == 3) {
-          commitOledSettingsIfDirty();
-        }
-        currentScreen = 0;
-        settingsAdjusting = false;
-        popupType = PopupType::None;
-        noteDisplayActivity();
-        drawCurrentScreen();
       }
     } else if (rightBtnHeld) {
       unsigned long heldMs = millis() - rightBtnDownMs;
-      if (!rightBtnLongSent && heldMs > 20 && (millis() - lastRightBtnPress) > 300) {
+      if (heldMs > 20 && (millis() - lastRightBtnPress) > 300) {
         lastRightBtnPress = millis();
         noteDisplayActivity();
         popupType = PopupType::None;
@@ -3230,7 +3221,21 @@ void loop() {
         selectBtnHeld = true;
         selectBtnDownMs = millis();
         selectHoldSaveDone = false;
+      } else if (!selectHoldSaveDone && batteryCharging && !chargeScreenSuppressed &&
+                 (millis() - selectBtnDownMs >= BTN_CHARGE_SELECT_LONG_PRESS_MS)) {
+        selectHoldSaveDone = true;
+        chargeScreenSuppressed = true;
+        chargeScreenUiReady = false;
+        if (currentScreen == 3) {
+          commitOledSettingsIfDirty();
+        }
+        currentScreen = 0;
+        settingsAdjusting = false;
+        popupType = PopupType::None;
+        noteDisplayActivity();
+        drawCurrentScreen();
       } else if (!selectHoldSaveDone && currentScreen == 3 &&
+                 !(batteryCharging && !chargeScreenSuppressed) &&
                  (millis() - selectBtnDownMs >= BTN_SETTINGS_HOLD_SAVE_MS)) {
         selectHoldSaveDone = true;
         saveOledSettings();
@@ -3242,7 +3247,8 @@ void loop() {
     } else if (selectBtnHeld) {
       unsigned long heldMs = millis() - selectBtnDownMs;
       if (!selectHoldSaveDone && heldMs > 20 && heldMs < BTN_SETTINGS_HOLD_SAVE_MS &&
-          (millis() - lastSelectBtnPress) > 300) {
+          (millis() - lastSelectBtnPress) > 300 &&
+          !(batteryCharging && !chargeScreenSuppressed)) {
         lastSelectBtnPress = millis();
         noteDisplayActivity();
         popupType = PopupType::None;
@@ -3280,6 +3286,7 @@ void loop() {
   if (millis() - lastBatteryRead >= 2000UL) {
     lastBatteryRead = millis();
     readBattery();
+    showChargingScreenIfSleeping();
     // readBattery() redraws only on plug-in; avoid extra full clear while charging
     if (popupType == PopupType::None && !(batteryCharging && !chargeScreenSuppressed)) {
       drawCurrentScreen();
