@@ -20,7 +20,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x01;     // Default Node ID
+uint8_t MY_ADDL = 0x05;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -125,7 +125,8 @@ const unsigned long UI_REFRESH_NORMAL_MS = 5000UL;
 // Charging animation tick (partial OLED updates — no full clear every frame)
 const unsigned long UI_REFRESH_CHARGING_MS = 500UL;
 const uint8_t STABLE_E22_TX_POWER = 3; // POWER_10: lowest-current E22 transmit mode.
-const bool PERIODIC_HELLO_ENABLED = false; // Avoid unattended RF current bursts.
+const bool PERIODIC_HELLO_ENABLED = true; // Required for nearby nodes to see this node as online.
+const unsigned long HELLO_BEACON_INTERVAL_MS = 5000UL;
 
 #define NUM_SCREENS 4
 
@@ -2212,6 +2213,7 @@ void sendHelloBeacon() {
 
     // Best-effort broadcast (0xFFFF). Doesn't affect counters/log.
     e22.sendFixedMessage(0xFF, 0xFF, CHANNEL, payload.c_str());
+    lastBeaconAt = millis();
 }
 
 // Clear configuration (erase stored NVS prefs for this namespace)
@@ -2610,7 +2612,7 @@ void drawWifiScreen() {
   display.drawFastHLine(ipIconX + 2, ipIconY + 7, 5, SSD1306_WHITE);
   display.setCursor(16, 46);
   display.print("IP ");
-  display.print(WiFi.softAPIP().toString());
+  display.print(WiFi.softAPIP().toString()+":80");
 
   drawScreenPageDots();
   display.display();
@@ -3053,6 +3055,7 @@ void setup() {
                     (batteryCharging ? "CHARGING RX ONLY" : "BROWNOUT RX ONLY");
         Serial.printf("[READY] Node 0x%02X%02X active (Net: 0x%02X)\n", 
             MY_ADDH, MY_ADDL, NETWORK_ID);
+        sendHelloBeacon();
     } else if (e22Started) {
         statusMsg = "CFG FAIL";
         showBootMessage("CONFIG FAILED", "Open Web setup");
@@ -3098,8 +3101,7 @@ void loop() {
 
   // Periodic discovery beacon to help UIs list nearby nodes
   if (nodeReady && PERIODIC_HELLO_ENABLED && radioTransmissionAllowed() &&
-      (millis() - lastBeaconAt >= 5000)) {
-      lastBeaconAt = millis();
+      (millis() - lastBeaconAt >= HELLO_BEACON_INTERVAL_MS)) {
       sendHelloBeacon();
   }
 
