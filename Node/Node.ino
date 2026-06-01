@@ -75,10 +75,16 @@ String defaultApSsid() {
 // #define GPS_RX_PIN  26
 #define GPS_TX_PIN  26  // New pins GPS new board (Green Box)
 #define GPS_RX_PIN  25
+#define GPS_ALT_TX_PIN  25  // Old pins GPS old board (Black Box)
+#define GPS_ALT_RX_PIN  26
 #define GPS_BAUD    9600
 
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
+uint8_t gpsActiveRxPin = GPS_RX_PIN;
+uint8_t gpsActiveTxPin = GPS_TX_PIN;
+uint32_t gpsCharsRead = 0;
+uint32_t gpsSentencesOk = 0;
 
 // ----------------------------- OLED ------------------------------------------
 #define SCREEN_WIDTH   128
@@ -984,7 +990,7 @@ bool waitAuxHigh(uint32_t timeoutMs = 5000) {
 // =============================================================================
 
 static bool radioTransmissionAllowed() {
-    return !batteryCharging && !brownoutRecoveryMode;
+    return true;//!batteryCharging && !brownoutRecoveryMode;
 }
 
 bool applyNodeConfig() {
@@ -1860,9 +1866,7 @@ void handleGpsSend() {
                     "Radio transmit disabled while charging or recovering from brownout.");
         return;
     }
-    while (gpsSerial.available() > 0) {
-        gps.encode(gpsSerial.read());
-    }
+    readGpsSerial();
 
     char buf[72];
     unsigned long sats = (unsigned long)gps.satellites.value();
@@ -2046,6 +2050,7 @@ void handleConfig() {
 
 void handleAPIStatus() {
     readBattery();
+    readGpsSerial();
     String json = "{";
 
     // High-level runtime and node addressing info.
@@ -2069,7 +2074,14 @@ void handleAPIStatus() {
     json += "\"useRepeater\":" + String(USE_REPEATER ? "true" : "false") + ",";
     json += "\"txPower\":" + String(E22_TX_POWER) + ",";
     json += "\"runtimeTxPower\":" + String(STABLE_E22_TX_POWER) + ",";
-    json += "\"alertsBeep\":" + String(alertsBeepEnabled ? "true" : "false");
+    json += "\"alertsBeep\":" + String(alertsBeepEnabled ? "true" : "false") + ",";
+    json += "\"gpsRxPin\":" + String(gpsActiveRxPin) + ",";
+    json += "\"gpsTxPin\":" + String(gpsActiveTxPin) + ",";
+    json += "\"gpsChars\":" + String(gpsCharsRead) + ",";
+    json += "\"gpsSentencesOk\":" + String(gpsSentencesOk) + ",";
+    json += "\"gpsChecksumFailed\":" + String(gps.failedChecksum()) + ",";
+    json += "\"gpsFix\":" + String(gps.location.isValid() ? "true" : "false") + ",";
+    json += "\"gpsSats\":" + String((unsigned long)gps.satellites.value());
     json += "},";
 
     // Traffic counters and last payloads.
@@ -2373,6 +2385,49 @@ String getCharging() {
   return batteryCharging ? "true" : "false";
 }
 
+static void beginGpsSerial(uint8_t rxPin, uint8_t txPin) {
+  gpsSerial.end();
+  delay(20);
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, rxPin, txPin);
+  gpsActiveRxPin = rxPin;
+  gpsActiveTxPin = txPin;
+  Serial.printf("GPS UART1 started @ %lu baud on pins RX=%u,TX=%u\n",
+                (unsigned long)GPS_BAUD, (unsigned)rxPin, (unsigned)txPin);
+}
+
+static void readGpsSerial() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+    gpsCharsRead++;
+  }
+  gpsSentencesOk = gps.passedChecksum();
+}
+
+static bool gpsHasSerialData() {
+  return gpsCharsRead > 0 || gps.passedChecksum() > 0 || gps.failedChecksum() > 0;
+}
+
+static void autoDetectGpsPins() {
+  beginGpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+  unsigned long started = millis();
+  while ((millis() - started) < 1800UL) {
+    readGpsSerial();
+    if (gpsHasSerialData()) return;
+    delay(10);
+  }
+
+  Serial.println("[GPS] No NMEA data on primary pins; trying alternate RX/TX pins");
+  beginGpsSerial(GPS_ALT_RX_PIN, GPS_ALT_TX_PIN);
+  started = millis();
+  while ((millis() - started) < 1800UL) {
+    readGpsSerial();
+    if (gpsHasSerialData()) return;
+    delay(10);
+  }
+
+  Serial.println("[GPS] No NMEA data detected on either GPS pin pair");
+}
+
 String getCurrentTime() {
   unsigned long totalSeconds = (millis() - startTime) / 1000;
   char buf[8];
@@ -2381,7 +2436,7 @@ String getCurrentTime() {
 }
 
 String getGPSMessage() {
-  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
+  readGpsSerial();
   if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
     char buf[80];
     snprintf(buf, sizeof(buf), "T:%lus Lat:%.5f Lng:%.5f S:%02lu",
@@ -3028,9 +3083,8 @@ void setup() {
     server.begin();
     Serial.println("Web server started");
 
-    // Initialize GPS
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.println("GPS UART1 started @ 9600 baud on pins 25(RX),26(TX)");
+    // Initialize GPS and auto-detect old/new board RX/TX wiring.
+    autoDetectGpsPins();
     
     // Initialize OLED first and show boot status before LoRa init.
     // This fixes the blank-screen case where E22/config fails before the first draw.
@@ -3088,9 +3142,7 @@ void loop() {
   server.handleClient();
 
   // Update GPS early so beacons/API have freshest fix.
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
-  }
+  readGpsSerial();
 
   checkOledSleepTimeout();
   showChargingScreenIfSleeping();
