@@ -20,7 +20,7 @@
 Preferences preferences;
 
 uint8_t MY_ADDH = 0x00;
-uint8_t MY_ADDL = 0x05;     // Default Node ID
+uint8_t MY_ADDL = 0x02;     // Default Node ID
 uint8_t TARGET_ADDH = 0x00;
 uint8_t TARGET_ADDL = 0x00; // Default Target
 uint8_t REPEATER_ADDH = 0xFF;
@@ -71,12 +71,8 @@ String defaultApSsid() {
 // ────────────────────────────────────────────────
 // GPS on Serial1
 // ────────────────────────────────────────────────
-// #define GPS_TX_PIN  25 //Old pins GPS old board (Black Box)
-// #define GPS_RX_PIN  26
 #define GPS_TX_PIN  26  // New pins GPS new board (Green Box)
 #define GPS_RX_PIN  25
-#define GPS_ALT_TX_PIN  25  // Old pins GPS old board (Black Box)
-#define GPS_ALT_RX_PIN  26
 #define GPS_BAUD    9600
 
 TinyGPSPlus gps;
@@ -2410,15 +2406,6 @@ static bool gpsHasSerialData() {
 static void autoDetectGpsPins() {
   beginGpsSerial(GPS_RX_PIN, GPS_TX_PIN);
   unsigned long started = millis();
-  while ((millis() - started) < 1800UL) {
-    readGpsSerial();
-    if (gpsHasSerialData()) return;
-    delay(10);
-  }
-
-  Serial.println("[GPS] No NMEA data on primary pins; trying alternate RX/TX pins");
-  beginGpsSerial(GPS_ALT_RX_PIN, GPS_ALT_TX_PIN);
-  started = millis();
   while ((millis() - started) < 1800UL) {
     readGpsSerial();
     if (gpsHasSerialData()) return;
