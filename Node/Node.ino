@@ -603,23 +603,23 @@ String toHex4(uint16_t addr) {
     return String(b);
 }
 
-static String radioEscapeField(const String &s) {
-    String out;
-    out.reserve(s.length() * 3);
-    const char *hex = "0123456789ABCDEF";
-    for (size_t i = 0; i < s.length(); i++) {
-        unsigned char c = (unsigned char)s.charAt(i);
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
-            out += (char)c;
-        } else {
-            out += '%';
-            out += hex[(c >> 4) & 0x0F];
-            out += hex[c & 0x0F];
-        }
-    }
-    return out;
-}
+// static String radioEscapeField(const String &s) {
+//     String out;
+//     out.reserve(s.length() * 3);
+//     const char *hex = "0123456789ABCDEF";
+//     for (size_t i = 0; i < s.length(); i++) {
+//         unsigned char c = (unsigned char)s.charAt(i);
+//         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+//             (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+//             out += (char)c;
+//         } else {
+//             out += '%';
+//             out += hex[(c >> 4) & 0x0F];
+//             out += hex[c & 0x0F];
+//         }
+//     }
+//     return out;
+// }
 
 static int8_t hexNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -647,21 +647,21 @@ static String radioUnescapeField(const String &s) {
     return out;
 }
 
-static bool radioBase64EncodeUtf8(const String &s, String &out) {
-    size_t olen = 0;
-    const size_t outLen = 4 * ((s.length() + 2) / 3) + 1;
-    unsigned char *buf = (unsigned char*)malloc(outLen);
-    if (!buf) return false;
+// static bool radioBase64EncodeUtf8(const String &s, String &out) {
+//     size_t olen = 0;
+//     const size_t outLen = 4 * ((s.length() + 2) / 3) + 1;
+//     unsigned char *buf = (unsigned char*)malloc(outLen);
+//     if (!buf) return false;
 
-    int rc = mbedtls_base64_encode(buf, outLen, &olen,
-                                   (const unsigned char*)s.c_str(), s.length());
-    if (rc == 0) {
-        buf[olen] = '\0';
-        out = String((const char*)buf);
-    }
-    free(buf);
-    return rc == 0;
-}
+//     int rc = mbedtls_base64_encode(buf, outLen, &olen,
+//                                    (const unsigned char*)s.c_str(), s.length());
+//     if (rc == 0) {
+//         buf[olen] = '\0';
+//         out = String((const char*)buf);
+//     }
+//     free(buf);
+//     return rc == 0;
+// }
 
 static bool radioBase64DecodeUtf8(const String &s, String &out) {
     size_t olen = 0;
@@ -1865,11 +1865,11 @@ void handleGpsSend() {
     readGpsSerial();
 
     char buf[72];
-    unsigned long sats = (unsigned long)gps.satellites.value();
+    // unsigned long sats = (unsigned long)gps.satellites.value();
     if (gps.location.isValid()) {
-        snprintf(buf, sizeof(buf), "GPS,Stas,%lu,%.6f,%.6f", sats, gps.location.lat(), gps.location.lng());
+        snprintf(buf, sizeof(buf), "%.6f,%.6f", gps.location.lat(), gps.location.lng());
     } else {
-        snprintf(buf, sizeof(buf), "GPS,Stas,%lu,0,0", sats);
+        snprintf(buf, sizeof(buf), "0,0");
     }
 
     bool useRelay = server.hasArg("relay");
