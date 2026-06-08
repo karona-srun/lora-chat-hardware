@@ -17,10 +17,10 @@
 #include "esp_sleep.h"
 
 // ----------------------------- WiFi credentials -------------------------------
-const char* ssid_AP    = "LMRalay-1";
+const char* ssid_AP    = "LMRalay-3";
 const char* password_AP = "12345678";
-
 // ----------------------------- Relay configuration ----------------------------
+
 #define REPEATER_ADDH  0xFF
 #define REPEATER_ADDL  0xFF
 #define COMMON_CHAN    0x41

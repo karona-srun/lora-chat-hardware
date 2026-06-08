@@ -11,7 +11,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <TinyGPSPlus.h>
+#include <TinyGPS++.h>
 #include <mbedtls/base64.h>
 #include <math.h>
 #include <esp_system.h>
@@ -81,6 +81,11 @@ uint8_t gpsActiveRxPin = GPS_RX_PIN;
 uint8_t gpsActiveTxPin = GPS_TX_PIN;
 uint32_t gpsCharsRead = 0;
 uint32_t gpsSentencesOk = 0;
+bool gpsHasFix = false;
+double gpsLat = 0.0;
+double gpsLng = 0.0;
+uint32_t gpsSatellites = 0;
+char gpsTimeUtc[16] = "--:--:--";
 
 // ----------------------------- OLED ------------------------------------------
 #define SCREEN_WIDTH   128
@@ -1865,9 +1870,8 @@ void handleGpsSend() {
     readGpsSerial();
 
     char buf[72];
-    // unsigned long sats = (unsigned long)gps.satellites.value();
-    if (gps.location.isValid()) {
-        snprintf(buf, sizeof(buf), "%.6f,%.6f", gps.location.lat(), gps.location.lng());
+    if (gpsHasFix) {
+        snprintf(buf, sizeof(buf), "%.6f,%.6f", gpsLat, gpsLng);
     } else {
         snprintf(buf, sizeof(buf), "0,0");
     }
@@ -2076,8 +2080,11 @@ void handleAPIStatus() {
     json += "\"gpsChars\":" + String(gpsCharsRead) + ",";
     json += "\"gpsSentencesOk\":" + String(gpsSentencesOk) + ",";
     json += "\"gpsChecksumFailed\":" + String(gps.failedChecksum()) + ",";
-    json += "\"gpsFix\":" + String(gps.location.isValid() ? "true" : "false") + ",";
-    json += "\"gpsSats\":" + String((unsigned long)gps.satellites.value());
+    json += "\"gpsFix\":" + String(gpsHasFix ? "true" : "false") + ",";
+    json += "\"gpsSats\":" + String((unsigned long)gpsSatellites) + ",";
+    json += "\"gpsLat\":" + String(gpsLat, 6) + ",";
+    json += "\"gpsLng\":" + String(gpsLng, 6) + ",";
+    json += "\"gpsTimeUtc\":\"" + jsonEscape(String(gpsTimeUtc)) + "\"";
     json += "},";
 
     // Traffic counters and last payloads.
@@ -2146,9 +2153,10 @@ void handleAPILog() {
 void handleAPINodes() {
     String json = "[";
     unsigned long now = millis();
-    const bool myFix = gps.location.isValid();
-    const double myLat = myFix ? gps.location.lat() : 0.0;
-    const double myLng = myFix ? gps.location.lng() : 0.0;
+    readGpsSerial();
+    const bool myFix = gpsHasFix;
+    const double myLat = myFix ? gpsLat : 0.0;
+    const double myLng = myFix ? gpsLng : 0.0;
     for (uint8_t i = 0; i < nearbyCount; i++) {
         if (json.length() > 1) json += ",";
         bool online = isNearbyNodeOnlineAt(i, now);
@@ -2212,11 +2220,12 @@ void sendHelloBeacon() {
         payload += cs;
     }
 
-    if (gps.location.isValid()) {
+    readGpsSerial();
+    if (gpsHasFix) {
         payload += "|";
-        payload += String(gps.location.lat(), 6);
+        payload += String(gpsLat, 6);
         payload += "|";
-        payload += String(gps.location.lng(), 6);
+        payload += String(gpsLng, 6);
     }
 
     // Best-effort broadcast (0xFFFF). Doesn't affect counters/log.
@@ -2392,27 +2401,45 @@ static void beginGpsSerial(uint8_t rxPin, uint8_t txPin) {
 }
 
 static void readGpsSerial() {
+  bool gotBytes = false;
   while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
+    const int c = gpsSerial.read();
+    if (c < 0) break;
+    gotBytes = true;
+    gps.encode((char)c);
     gpsCharsRead++;
   }
-  gpsSentencesOk = gps.passedChecksum();
-}
 
-static bool gpsHasSerialData() {
-  return gpsCharsRead > 0 || gps.passedChecksum() > 0 || gps.failedChecksum() > 0;
-}
-
-static void autoDetectGpsPins() {
-  beginGpsSerial(GPS_RX_PIN, GPS_TX_PIN);
-  unsigned long started = millis();
-  while ((millis() - started) < 1800UL) {
-    readGpsSerial();
-    if (gpsHasSerialData()) return;
-    delay(10);
+  if (gps.location.isValid()) {
+    gpsHasFix = true;
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
   }
+  if (gps.satellites.isValid()) {
+    gpsSatellites = gps.satellites.value();
+  }
+  if (gps.time.isValid()) {
+    snprintf(gpsTimeUtc, sizeof(gpsTimeUtc), "%02d:%02d:%02d",
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+  }
+  gpsSentencesOk = gps.passedChecksum();
 
-  Serial.println("[GPS] No NMEA data detected on either GPS pin pair");
+  static uint32_t lastGpsDebugMs = 0;
+  if (gotBytes && (millis() - lastGpsDebugMs >= 5000UL)) {
+    lastGpsDebugMs = millis();
+    Serial.printf("[GPS] chars=%lu ok=%lu fail=%lu fix=%s sats=%lu lat=%.6f lng=%.6f\n",
+                  (unsigned long)gpsCharsRead,
+                  (unsigned long)gpsSentencesOk,
+                  (unsigned long)gps.failedChecksum(),
+                  gpsHasFix ? "yes" : "no",
+                  (unsigned long)gpsSatellites,
+                  gpsLat,
+                  gpsLng);
+  }
+}
+
+static void startGps() {
+  beginGpsSerial(GPS_RX_PIN, GPS_TX_PIN);
 }
 
 String getCurrentTime() {
@@ -2424,16 +2451,16 @@ String getCurrentTime() {
 
 String getGPSMessage() {
   readGpsSerial();
-  if (gps.location.isValid() && gps.date.isValid() && gps.time.isValid()) {
+  if (gpsHasFix) {
     char buf[80];
     snprintf(buf, sizeof(buf), "T:%lus Lat:%.5f Lng:%.5f S:%02lu",
-             (unsigned long)(millis() / 1000), gps.location.lat(), gps.location.lng(),
-             (unsigned long)gps.satellites.value());
+             (unsigned long)(millis() / 1000), gpsLat, gpsLng,
+             (unsigned long)gpsSatellites);
     return String(buf);
   }
   char buf[64];
   snprintf(buf, sizeof(buf), "No fix  Sats:%02lu  T:%lus",
-           (unsigned long)gps.satellites.value(), (unsigned long)(millis() / 1000));
+           (unsigned long)gpsSatellites, (unsigned long)(millis() / 1000));
   return String(buf);
 }
 
@@ -2575,7 +2602,7 @@ void drawStatusScreen() {
   
   display.setCursor(4, 26);
   display.print("GPS ");
-  display.print(gps.satellites.value());
+  display.print(gpsSatellites);
   display.print(" sats");
   display.setCursor(82, 26);
   if(batteryCharging){
@@ -2720,7 +2747,7 @@ static void drawNavigationCompass(double bearingDeg, bool bearingValid) {
 }
 
 void drawGpsScreen() {
-  getGPSMessage();
+  readGpsSerial();
   display.clearDisplay();
   drawHeader();
   drawScreenDivider();
@@ -2730,7 +2757,7 @@ void drawGpsScreen() {
   
   display.setCursor(4, 16);
   display.print("GPS ");
-  display.print(gps.satellites.value());
+  display.print(gpsSatellites);
   display.print(" sv");
 
   // Right side navigation compass (uses GPS course/track angle).
@@ -2738,13 +2765,13 @@ void drawGpsScreen() {
   const double courseDeg = courseValid ? gps.course.deg() : 0.0;
   drawNavigationCompass(courseDeg, courseValid);
   
-  if (gps.location.isValid()) {
+  if (gpsHasFix) {
     display.setCursor(4, 26);
     display.print("Lat ");
-    display.print(gps.location.lat(), 5);
+    display.print(gpsLat, 5);
     display.setCursor(4, 36);
     display.print("Lng ");
-    display.print(gps.location.lng(), 5);
+    display.print(gpsLng, 5);
     if (gps.altitude.isValid()) {
       display.setCursor(4, 46);
       display.print("Alt ");
@@ -2756,7 +2783,7 @@ void drawGpsScreen() {
     display.print("No fix yet");
     display.setCursor(4, 40);
     display.print("In view ");
-    display.print(gps.satellites.value());
+    display.print(gpsSatellites);
   }
 
   drawScreenPageDots();
@@ -3070,9 +3097,9 @@ void setup() {
     server.begin();
     Serial.println("Web server started");
 
-    // Initialize GPS and auto-detect old/new board RX/TX wiring.
-    autoDetectGpsPins();
-    
+    // Initialize GPS on the same UART1 pins used by the working relay sketch.
+    startGps();
+
     // Initialize OLED first and show boot status before LoRa init.
     // This fixes the blank-screen case where E22/config fails before the first draw.
     initOled();
